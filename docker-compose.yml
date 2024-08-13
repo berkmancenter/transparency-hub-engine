@@ -1,0 +1,44 @@
+# docker-compose.yml
+
+services:
+  orchestrator:
+    image: document_capture:2.1
+    build: .
+    volumes:
+      # Mount Docker socket to spawn containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared volume for crawl data - accessible from host AND containers
+      - crawl-shared-data:/app/tmp
+      # Import GCP credentials - note that the path is different on Windows
+      - ${GCLOUD_CONFIG_DIR}:/root/.config/gcloud
+      # Logs
+      # .logs:/app/logs
+      # This line will save the database locally at /db/
+      # Make sure the path after the colon matches CAPTURES_DIR
+      # - ./db:/app/tmp/docs
+      # This line is required to run the crawler using a local metadata database
+      # - ./db:/app/db
+    environment:
+      - DRY_RUN=${DRY_RUN}
+      - TEMP_DIR=/app/tmp
+      - CAPTURES_DIR=/app/tmp/docs
+      - SYNC_PRIORITY=${SYNC_PRIORITY}
+      - CONFIG_PATH=${CONFIG_PATH}
+      - MONGODB_URL=${MONGODB_URL}
+      - GCLOUD_PROJECT=${GCLOUD_PROJECT}
+      - GCP_BUCKET=${GCP_BUCKET}
+      - RUNNING_IN_DOCKER=true
+    configs:
+      - source: config
+        target: /app/${CONFIG_PATH}
+  crawler:
+    image: browsertrix-thub:1.2
+    profiles: ["manual"]
+    volumes:
+      - crawl-shared-data:/crawls
+configs:
+  config:
+    file: ${CONFIG_PATH}
+volumes:
+    crawl-shared-data:
+      name: crawl-shared-data

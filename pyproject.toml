@@ -1,0 +1,19 @@
+[project]
+name = "transparency_archives"
+version = "0.9.1"
+description = "ASML Lab Transparency Hub backend"
+readme = "README.md"
+dependencies = [
+    "bs4>=0.0.2",
+    "charset-normalizer>=3.4.2",
+    "docker>=7.1.0",
+    "langdetect>=1.0.9",
+    "lxml>=6.0.4",
+    "pymongo>=4.13.2",
+    "PyPDF2>=3.0.1",
+    "python-dotenv>=1.1.0",
+    "PyYAML>=6.0.2",
+    "rapidfuzz>=3.14.3",
+    "google-cloud-storage>=3.4.1",
+    "google-cloud-run>=0.16.0"
+]
