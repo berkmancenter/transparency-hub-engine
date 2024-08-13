@@ -1,0 +1,192 @@
+# Config File for the Transparency Archiver - Online Document Capture Tool
+# The Transparency Archiver also supports some command line arguments and a .env file for configuration, see the README for more information
+
+# Use a JSON File instead of the Mongo Database to retrieve company data
+# Useful when you don't want to run the full sync and are only interested in a selected group of companies
+# If this option is true, COMPANIES_JSON must be set in the config file
+# Defaults to false
+USE_LOCAL_COMPANIES: false
+# Path to the local .json or .bson file to use as the Companies collection
+# This will be used if USE_LOCAL_COMPANIES is true or if USE_MONGO is false
+# Ignored if USE_LOCAL_COMPANIES is false
+# Defaults to "db/companies.json"
+COMPANIES_JSON: db/companies.json
+
+# Fuzzy ratio to use when comparing documents to evaluate if content has changed
+# Defaults to 97
+FUZZY_RATIO: 94
+
+# Number of workers to utilize while running the capture process, scale based on available resources
+# Defaults to 4
+MAX_WORKERS: 4
+
+# Maximum time each capture can take, in seconds
+# Decreasing this value may help if the capture process is taking too long, but may reduce the number of policies captured
+# Defaults to 1200 (20 minutes), which means the capture will have a maximum of 20 minutes for each policy
+TIMEOUT: 1200
+
+# Whether or not to use MongoDB connections for storing the capture data
+# If this option is true, DB_NAME must be set in the config and MONGODB_URL must be set in the .env file
+# If this option is false, COMPANIES_JSON, DOCUMENTS_JSON, and CHANGES_JSON must be set in the config file
+# Defaults to true
+USE_MONGO: true
+# Name of the database in your instance of MongoDB
+# Defaults to "dev_db"
+DB_NAME: transparencydb_dev
+# Path to the local .bson file to use as the Document collection
+# This will only be used if USE_MONGO is set to true
+# Defaults to "db/documents.bson"
+DOCUMENTS_JSON: db/documents.bson
+# Path to the local .bson file to use as the Changes collection
+# This will only be used if USE_MONGO and CREATE_CHANGES are set to true
+# Defaults to "db/changes.bson"
+CHANGES_JSON: db/changes.bson
+
+# Whether or not to use a Google Storage Bucket to store the capture results
+# If this option is true, GCP_BUCKET must be set in the .env file
+# This option is ignored when running in Google Cloud Run
+# If this option is false, the capture will assume that previous document versions can be found at CAPTURES_DIR
+# Defaults to true
+USE_GCP: true
+
+# Whether to send Slack notifications on job completion and errors
+# Requires SLACK_WEBHOOK_URL to be set in the .env file
+# Defaults to false
+USE_SLACK: false
+
+# Whether or not to create the .CHANGES.json files from the captures
+# This should be set to false if you don't need to compare the documents over time
+# Defaults to true
+CREATE_CHANGES: true
+
+# Prioritization of the selected companies to establish frequency of captures
+# The higher the value, the more frequently the capture will be made
+# The lower the value, the less frequently the capture will be made
+# The default value is 1, which means the capture will be attempted once per month
+# The value can be set to 0 to disable captures for a company
+# Note that these are intended for use in Google Cloud Run with a scheduler, which is required to set up the regularity of captures
+# 
+# VALUES:
+# - 0: Disable capture for a company
+# - 1: Attempt capture once per month
+# - 2: Attempt capture once per week
+# - 3: Attempt capture once per day
+# - 4: Use 4 or higher when adding new companies to the database to run only on those companies
+# 
+# The company_id must match the _id field in the Mongo Companies database or in the input JSON file
+# If a company is not in this dictionary, it will be attempted to be captured once per month (Equivalent to 1)
+# It will ignore unknown company_ids
+# Defaults to an empty dictionary, which means captures will only be ran at SYNC_PRIORITY = 1
+PRIORITY_DICT:
+  # Keys are MongoDB ObjectIDs from the companies collection (_id field).
+  # To find an ID: open MongoDB Compass and look up the company, or run: db.companies.find({name: "Platform"})
+  # Replace these with the ObjectIDs from your own database before use.
+  # "_id": priority_level
+  "675211559efd527760c64413" : 3 # Facebook/Meta
+  "675211559efd527760c6441a" : 3 # Reddit
+  "675211559efd527760c64416" : 3 # LinkedIn
+  "675211559efd527760c6441d" : 2 # Telegram
+  "675211559efd527760c6441b" : 3 # YouTube
+  "675211559efd527760c64414" : 3 # Twitter/X
+  "675211559efd527760c64419" : 2 # Pinterest
+  "675211559efd527760c64417": 3 # Snapchat
+  "6840b087a96cab74c26a3260" : 3 # Discord
+  "675211559efd527760c64418" : 3 # TikTok
+
+
+# This dictionary manages the detection of topics for the .CHANGES.json files
+# Each topic should reference a valid list of regexes to match against added or removed text from the documents
+# Defaults to an empty dictionary, which means no topics will be identified
+TOPIC_PATTERNS: 
+  "Mandatory Arbitration": 
+    - arbitration\s+(?:is\s+)?(?:mandatory|required)
+    - (?:must|shall|required to)\s+(?:submit|resolve).*arbitration
+    - binding\s+arbitration
+    - waive.*right.*jury\s+trial
+  "AI/LLM Usage": 
+    - artificial\s+intelligence
+    - \bAI\b
+    - machine\s+learning
+    - large\s+language\s+model
+    - \bLLM\b
+    - automated\s+(?:decision|processing)
+    - algorithmic\s+processing
+  "Opt-In Clauses": 
+    - 'opt[\s-]in'
+    - affirmative(?:ly)?\s+consent
+    - explicit(?:ly)?\s+(?:agree|consent)
+    - must\s+(?:agree|consent)
+    - require.*consent
+  "Opt-Out Clauses": 
+    - 'opt[\s-]out'
+    - may\s+(?:decline|refuse|withdraw)
+    - unsubscribe
+    - right\s+to\s+(?:decline|refuse|withdraw)
+  "Do Not Track":
+    - do\s+not\s+track
+    - \bdnt\b
+  "Data Sharing": 
+    - (?:share|sell|disclose).*(?:personal\s+)?(?:data|information)
+    - 'third[\s-]party.*(?:data|information)'
+    - data\s+(?:sharing|selling|disclosure)
+  "Privacy Rights": 
+    - right\s+to\s+(?:access|delete|correct|port)
+    - data\s+(?:access|deletion|correction|portability)\s+right
+    - privacy\s+rights
+  "CCPA":
+    - \bCalifornia\s+consumer\s+privacy\s+act\b
+    - \bCCPA\b
+    - \bCPRA\b
+  "GDPR (EU)":
+    - \bGDPR\b
+    - general\s+data\s+protection\s+regulation
+  "User Content": 
+    - 'user[\s-]generated\s+content'
+    - (?:your|user)\s+content
+    - license.*content
+    - intellectual\s+property.*content
+  "Liability Limitations":
+    - limit(?:ation)?.*liability
+    - not\s+liable\s+for
+    - disclaim.*(?:warranties|liability)
+    - maximum\s+liability
+  "Termination Rights": 
+    - (?:terminate|suspend|cancel).*account
+    - termination.*(?:rights|conditions)
+    - may\s+(?:terminate|suspend)
+  "Cookie Usage": 
+    - \bcookies?\b
+    - tracking\s+technologies
+    - web\s+beacons
+    - local\s+storage
+  "Biometrics":
+    - \bbiometrics?\b
+    - \b(?:face|facial|fingerprint|voiceprint|iris)\b.*\b(?:scan|template|identifier)\b
+  "Governing / Choice of Law":
+    - '\b(?:governing|choice of)\s+laws?\b'
+
+#
+#
+### NOT CURRENTLY IMPLEMENTED ###
+#
+#
+
+# Whether to run the automated capture of new companies
+# If true, it will look for new Social Media companies in the Google Play Store and Apple App Store before running the capture process
+# ADD_NEW_COMPANIES: false
+# NEW_COMPANIES_SOURCE : {
+#   # Google app links use the pattern /store/apps/details?id=<package_id>
+#   "Google Play Store" : "https://play.google.com/store/apps/category/SOCIAL",
+#   # Apple app links use the pattern /us/app/<app_name>/id<package_id>
+#   "Apple App Store" : [
+#     "https://apps.apple.com/us/iphone/charts/6005?chart=top-free",
+#     "https://apps.apple.com/us/ipad/charts/6005?chart=top-free",
+#     "https://apps.apple.com/us/ipad/charts/6005?chart=top-paid",
+#     "https://apps.apple.com/us/iphone/charts/6005?chart=top-paid"
+#   ]
+# }
+
+# Whether to extract Archival Data for new companies
+# If true, it will attempt to extract archive data from the Wayback Machine for new companies
+# Note that this will significantly increase the runtime of the capture process, as the Wayback Machine is rate limited
+# EXTRACT_ARCHIVE_DATA: false
