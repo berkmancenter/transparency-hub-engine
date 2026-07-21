@@ -17,6 +17,7 @@ import json
 import langdetect
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 # Local Imports
 from source.globals import CFG, logger
@@ -24,7 +25,7 @@ from source.utils import get_gcs_bytes, decode_bytes
 
 
 def has_content_changed(
-    oldText: str, newText: str, threshold: int = CFG.FUZZY_THRESHOLD
+    oldText: str, newText: str, threshold: Optional[int] = None
 ) -> bool:
     """
     Identifies if the content of two documents has changed
@@ -33,11 +34,13 @@ def has_content_changed(
     Args:
         oldText (str): The text of the old document
         newText (str): The text of the new document
-        threshold (int, optional): The threshold for fuzzy matching. Defaults to FUZZY_THRESHOLD.
+        threshold (int, optional): The threshold for fuzzy matching. Defaults to the live CFG.FUZZY_THRESHOLD value.
 
     Returns:
         bool: True if the content has changed beyond the threshold, False otherwise
     """
+    if threshold is None:
+        threshold = CFG.FUZZY_THRESHOLD
 
     def text_normalize(text: str) -> str:
         """
@@ -86,7 +89,7 @@ def read_text_from_html(htmlObj: bytes) -> str:
     return soup.get_text(separator=" ", strip=True)
 
 
-def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
+def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
     """
     A wrapper for extracting text from a WARC file bundle
 
@@ -293,7 +296,7 @@ def compare_json_files(gcsBytes: bytes, localPath: Path) -> bool:
     return has_content_changed(extract_json_text(localJson), extract_json_text(gcsJson))
 
 
-def data_quality_check(text: str) -> bool:
+def data_quality_check(text: Optional[str]) -> bool:
     # If the text is None or empty, return False
     if text is None or len(text.strip()) == 0:
         return False
@@ -333,7 +336,7 @@ def _compare_files_sync(localPath: Path, gcpPath: str, format: str, bucket) -> b
 
 
 async def compare_files_async(
-    localPath: Path, gcpPath: str, format: str, bucket, timeout: int = 300
+    localPath: Path, gcpPath: str, format: str, bucket, timeout: float = 300
 ) -> bool:
     loop = asyncio.get_running_loop()
     try:
@@ -382,7 +385,7 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
     return data_quality_check(text)
 
 
-async def validate_file_async(localPath: Path, format: str, timeout: int = 300) -> bool:
+async def validate_file_async(localPath: Path, format: str, timeout: float = 300) -> bool:
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
@@ -397,7 +400,7 @@ async def validate_file_async(localPath: Path, format: str, timeout: int = 300) 
 
 
 def compare_files(
-    localPath: Path, gcpPath: str, format: str, bucket, timeout: int = 300
+    localPath: Path, gcpPath: str, format: str, bucket, timeout: float = 300
 ) -> bool:
     """
     Wrapper function for compare_files_async, allows for setting a timeout in case the file processing pipeline hangs
@@ -407,18 +410,18 @@ def compare_files(
       gcpPath (str): Path to the GCP file
       format (str): Format of the file
       bucket (str): Name of the GCP bucket (None if running in Google Cloud)
-      timeout (int): Timeout in seconds, defaults to 300 (5 minutes)
+      timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
     return asyncio.run(compare_files_async(localPath, gcpPath, format, bucket, timeout))
 
 
-def validate_file(localPath, format, timeout=300):
+def validate_file(localPath, format, timeout=300.0):
     """
     Wrapper function for validate_file_async, allows for setting a timeout in case the file processing pipeline hangs
 
     Args:
       localPath (str): Path to the local file
       format (str): Format of the file
-      timeout (int): Timeout in seconds, defaults to 300 (5 minutes)
+      timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
     return asyncio.run(validate_file_async(localPath, format, timeout))

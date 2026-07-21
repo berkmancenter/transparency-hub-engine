@@ -7,13 +7,14 @@ The Transparency Archiver powers the [Transparency Hub](https://hub.transparency
 ---
 
 ## Summary
- - [About](#about)
- - [Main Features](#main-features)
- - [Development](#development)
+
+- [About](#about)
+- [Main Features](#main-features)
+- [Development](#development)
 
 ---
 
-## About 
+## About  
 
 This is a document capture pipeline written in Python designed to be used with a custom locally hosted docker fork of Browsertrix Crawler.
 
@@ -31,12 +32,12 @@ It is recommended to run the Transparency Archiver as a docker image, but it is 
 
 It is designed to read data from a MongoDB (preferred) or .json file and retrieve current versions of documents from the urls in the data.
 
-
 We aim to store each document in 5 formats: txt, json, html, pdf, and wacz.
-Our data is stored in a MongoDB instance in 3 collections: `companies`, `documents`, and `changes`. 
+Our data is stored in a MongoDB instance in 3 collections: `companies`, `documents`, and `changes`.  
 
 Example `company` database entry:
-```
+
+```bson
 {
   "_id": {
     "$oid": "675211559efd527760c64413"
@@ -63,7 +64,8 @@ Example `company` database entry:
 ```
 
 Example `document` database entry:
-```
+
+```bson
 {
   "_id": {
     "$oid": "67784259cef22046ad5f727c"
@@ -80,18 +82,19 @@ Example `document` database entry:
 }
 ```
 
+### MongoDB Compass ([Mongo website](https://www.mongodb.com/compass))
 
-### MongoDB Compass (https://www.mongodb.com/compass) ###
 Transparency Archiver - Online Document Capture Tool is designed to work with a Mongo Database to maintain company and document information across multiple captures, although it can be configured to use local .json files.
 
 Download MongoDB Compass so you can view & engage with the data in a friendly UI.  You'll need to get a local instance running and then set your environment variable to point to it.
 To run the local instance, create "C:\data\db" then cd to "C:\Program Files\MongoDB\Server\8.0\bin" and run `mongod`
 
-`export MONGODB_URL='mongodb://localhost:27017/'` 
+`export MONGODB_URL='mongodb://localhost:27017/'`
 
 To view the front end, you'll need node.js and npm (see transparency_hub repo)
 
-### Google Cloud Platform Bucket ###
+### Google Cloud Platform Bucket
+
 Transparency Archiver - Online Document Capture Tool is designed to work with a Google Storage bucket for Snapshot storage, although it can be configured to use your local filesystem instead.
 
 Check out their [getting started guide](https://docs.cloud.google.com/docs/get-started) and their info on [creating a storage bucket](https://docs.cloud.google.com/storage/docs)
@@ -118,7 +121,7 @@ The .pdf format is provided for primary target urls in the Transparency Archiver
 
 The .html of the primary target url is provided as a closer-to-text format that preserves content the .txt format might have missed.  It can also be parsed to remove unwanted text material from a capture, such as detection of content from headers, footers, or pop-ups.  
 
-### TXT 
+### TXT
 
 The .txt format is provided for easy data access, parsing, and comparison.  This is a simple text parse of the client-side html at time of capture, and may include non-document content such as headers, footers, or pop-ups.
 
@@ -131,14 +134,17 @@ The .CHANGES.json format is a change object based on the patience difference alg
 ---
 
 ### Running a DB sync: main.py
+
 The way we make production DB updates is by running the main.py script. This script reads through the `companies` database, fetches the current content at the listed `doc_urls`, compares it to the most recent snapshot of that policy document for that company (per format type), and then creates a new archive if they differ.  This script is designed to automatically update the MongoDB and GCP Storage Bucket it is given access to.
 
 #### Running in Docker
+
 This repo is set up to run as a docker image.  If you have Docker installed and running, you can use `docker-compose build` and `docker-compose up` to run the sync.
 
 This pipeline requires a built image of our [custom fork of BrowsertrixCrawler](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler) available in your Docker engine.  See that repo for build instructions.
 
 #### Running Locally
+
 This repo can be run locally with a user-installation of Python 3.13.3.  It still requires a built image of our [custom fork of BrowsertrixCrawler](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler) available in your Docker engine.  See that repo for build instructions.
 
 This script offers the following customization options from the command line:
@@ -168,13 +174,14 @@ Accepts a mongo connection string.  See MongoDB documentation for more details.
 
 `--gcloud_job` the Google Cloud Platform identifier for the Cloud Job of your custom BrowsertrixCrawler fork (default: my-job-1234)
 
-`--sync_priority` the priority level to run the sync at, highly configurable using the PRIORITY_DICT in the config.  When set to 1, will run on all companies not disabled in the config. (default: 1) 
+`--sync_priority` the priority level to run the sync at, highly configurable using the PRIORITY_DICT in the config.  When set to 1, will run on all companies not disabled in the config. (default: 1)
 Accepts any positive integer, though generally should be between 1-4 depending on your configuration setup.
 
 `--config` the Path to the configuration file. (default: config.yaml)
 Accepts any valid Path.
 
 #### Running on Google Cloud Platform
+
 The sync can be packaged to the Google Cloud Platform Artifact Registry if enabled on your project.  See `upload.demo.ps1` for guidelines on how to automatically push the sync to this Artifact Registry.  You'll also need to upload the config file to your Google Cloud Platform Storage Bucket, and will need to have a hosted MongoDB instance accessible with a connection string.  
 
 The sync job can then be configured with the following options:
@@ -210,24 +217,43 @@ MONGODB_URL should be established as a secret using the Google Cloud Platform Se
 This project is part of the Transparency Hub ecosystem maintained by the Berkman Klein Center for Internet & Society at Harvard University:
 
 | Repository | Description |
-|-----------|-------------|
+| ----------- | ------------- |
 | **[Transparency Hub](https://github.com/berkmancenter/transparency-hub)** | Next.js frontend — the public-facing website |
 | **[Transparency Archiver](https://github.com/berkmancenter/transparency-hub-engine)** | Python pipeline that uses this crawler to archive policy documents |
 | **[Browsertrix Crawler Fork](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler)** (this repo) | Custom fork of Browsertrix Crawler |
 
-
 ## Development
 
 ### Pre-commit hooks
+
 Install dev dependencies and activate the hooks once after cloning:
-```
+
+```bash
 pip install -r requirements-dev.txt
 pre-commit install
 ```
+
 This runs `ruff format` and `ruff check --fix` automatically on every commit.
 
 ### Linting (manual)
+
 `ruff format && ruff check --fix`
+
+### Testing
+
+The test suite lives in `tests/` and uses `pytest`. Install it alongside the runtime dependencies:
+
+`pip install -r requirements.txt && pip install pytest pytest-cov`
+
+Then run the suite from the repo root:
+
+`pytest`
+
+To see a coverage report:
+
+`pytest --cov --cov-report=term-missing`
+
+All external dependencies (MongoDB, Google Cloud Storage, the Browsertrix Crawler docker/subprocess/Cloud Run invocations, Slack webhooks, the filesystem) are faked or mocked, so the suite has no network, database, or docker requirements and never touches your real `.env`, `tmp/`, `logs/`, or `db/` directories. It also strips the handful of environment variables this codebase reads (`MONGODB_URL`, `GCP_BUCKET`, etc.) before each test, so a developer's local `.env` credentials never leak into test assertions.
 
 ## Contributing
 

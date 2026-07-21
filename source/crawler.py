@@ -26,7 +26,7 @@ class BrowsertrixCrawler:
 
     def __init__(
         self,
-        dockerImage: str = "browsertrix-thub:1.1",
+        dockerImage: str = "browsertrix-thub:1.2",
         maxWorkers: int = CFG.MAX_WORKERS,
         mode: str = "document_capture",
     ):
@@ -227,7 +227,7 @@ class BrowsertrixCrawler:
                     for pValue in pValues
                 ]
             except docker.errors.ContainerError as e:  # type: ignore
-                end_time = time.time()
+                endTime = time.time()
                 duration = endTime - startTime
 
                 logger.error(
@@ -243,7 +243,7 @@ class BrowsertrixCrawler:
                         "url": url,
                         "pValues": pValues,
                         "duration": duration,
-                        "error": e.exitcode,
+                        "error": e.exit_status,
                     }
                 ]
             except Exception as e:

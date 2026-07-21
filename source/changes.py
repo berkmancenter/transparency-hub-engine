@@ -285,34 +285,42 @@ def reconstruct_with_whitespace(wordDiff: list, sp1: dict, sp2: dict) -> list:
     result = []
     idx1 = 0
     idx2 = 0
+    # Track the status of the previous word token so whitespace/special characters
+    # can inherit it. Starts as (False, False) so leading whitespace is unchanged.
+    prevAdded = False
+    prevRemoved = False
 
     for word, isAdded, isRemoved in wordDiff:
         if isRemoved:
             # Use special characters from past document
             if idx1 in sp1 and sp1[idx1]:
-                result.append((sp1[idx1], False, False))
+                result.append((sp1[idx1], prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx1 += 1
         elif isAdded:
             # Use special characters from new document
             if idx2 in sp2 and sp2[idx2]:
-                result.append((sp2[idx2], False, False))
+                result.append((sp2[idx2], prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx2 += 1
         else:
             # Unchanged word - prefer new special characters, fall back to old
             ws = sp2.get(idx2, sp1.get(idx1, ""))
             if ws:
-                result.append((ws, False, False))
+                result.append((ws, prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx1 += 1
             idx2 += 1
 
-    # Handle any trailing whitespace
+        # Update previous token status after appending the word
+        prevAdded = isAdded
+        prevRemoved = isRemoved
+
+    # Handle any trailing whitespace, inherits the last word's status
     if idx1 in sp1:
-        result.append((sp1[idx1], False, False))
+        result.append((sp1[idx1], prevAdded, prevRemoved))
     elif idx2 in sp2:
-        result.append((sp2[idx2], False, False))
+        result.append((sp2[idx2], prevAdded, prevRemoved))
 
     return result
 

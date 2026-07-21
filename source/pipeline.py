@@ -108,10 +108,11 @@ class DocumentPipeline:
             if not CFG.IN_CLOUD and CFG.USE_GCP:
                 upload_to_GCP(fileNames, self.googleBucket)
 
+            # Notify slack
             if len(mongoData) > 0:
-                new_ids = [m["company_id"] for m in mongoData]
+                new_ids = [m["company_id"] for m in mongoData if m["format"] == "txt"]
                 try:
-                    # Only notify slack if the company has new documents
+                    # Only notify slack if the company has a new text capture
                     for pData in companyData["pValues"]:
                         if pData["objId"] in new_ids:
                             notify_slack(

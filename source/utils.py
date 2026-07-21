@@ -59,6 +59,7 @@ def get_all_companies() -> list:
     Fetches all companies from MongoDB or specified JSON or BSON file, depending on USE_MONGO and USE_LOCAL_COMPANIES flag.
     """
     if CFG.USE_MONGO and not CFG.USE_LOCAL_COMPANIES:
+        client = None
         try:
             client = mongo_connect()
             collection = client[CFG.DB_NAME]["companies"]
@@ -70,8 +71,9 @@ def get_all_companies() -> list:
         except Exception as e:
             raise Exception(f"Failed to fetch companies from MongoDB: {e}")
         finally:
-            # Close the client connection
-            client.close()
+            # Close the client connection, if one was ever established
+            if client is not None:
+                client.close()
     else:
         return pull_db(CFG.COMPANIES_JSON, False)
 
@@ -107,7 +109,7 @@ def get_validated_companies() -> list:
         pExclude = [
             p
             for p in pData
-            if CFG.PRIORITY_DICT.get(str(p["_id"]))
+            if CFG.PRIORITY_DICT.get(str(p["_id"])) is not None
             and CFG.PRIORITY_DICT[str(p["_id"])] == 0
         ]
         pData = [p for p in pData if p not in pExclude]
@@ -291,7 +293,7 @@ class DocumentCache:
         else:
             if len(self._cache) >= self.capacity:
                 self._cache.popitem(last=False)  # Evict LRU (front)
-            self._cache[path] = text
+        self._cache[path] = text
 
     def __len__(self) -> int:
         return len(self._cache)

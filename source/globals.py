@@ -69,6 +69,16 @@ class AppConfig:
 CFG = AppConfig()
 
 
+def str_to_bool(value: str) -> bool:
+    """
+    Parses a CLI string argument into a bool. `argparse`'s built-in `type=bool`
+    just calls `bool()` on the raw string, so any non-empty value (including
+    "false") evaluates to True; this treats common truthy/falsy strings as
+    expected instead.
+    """
+    return value.lower() in ("true", "1", "yes", "t", "y")
+
+
 def init_globals():
     # Check if this is running locally or on Google Cloud Run
     # As per: https://docs.cloud.google.com/run/docs/container-contract
@@ -94,7 +104,7 @@ def init_globals():
 
     parser.add_argument(
         "--dry_run",
-        type=bool,
+        type=str_to_bool,
         default=os.getenv("DRY_RUN", "false").lower() == "true",
         help="Conduct a dry run, will not save outputs to external connections, will not delete temporary files from runtime (default: false)",
     )
@@ -236,8 +246,8 @@ def init_globals():
         with open(CFG.LOG_DIR / "recovery_log.txt", "r") as f:
             recovery: list = f.read().splitlines()
         CFG.RECOVERY_DATA = recovery
-    except FileNotFoundError:
-        logger.info("No recovery file found, assuming fresh start")
+    except FileNotFoundError as e:
+        logger.error(f"No recovery file found, assuming fresh start: {e}")
     except Exception as e:
         logger.error(
             f"Loading recovery file failed, check {CFG.LOG_DIR / 'recovery_log.txt'}: {e}"
