@@ -61,9 +61,10 @@ class TestInit:
         )
         assert proc.genItemInfo["company_id"] == "co1"
         assert proc.genItemInfo["type"] == "privacy_policy"
-        assert proc.genItemInfo["original_url"] == crawl_result["url"]
+        assert "original_url" not in proc.genItemInfo
         assert proc.failCounter == 0
         assert proc.confirmedNew is False
+        assert proc.formats == {}
         assert proc.results == []
         assert proc.fileNames == []
 
@@ -156,14 +157,18 @@ class TestProcessFormat:
     ):
         _, _c_dir, a_dir, _j_dir = crawl_dirs
         (a_dir / "capture.txt").write_text("hello")
-        monkeypatch.setattr(processor, "verify_content", lambda item, path: True)
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
 
         processor.process_format(("txt", a_dir))
 
         assert processor.confirmedNew is True
         assert processor.failCounter == 0
-        assert len(processor.results) == 1
-        assert processor.results[0]["format"] == "txt"
+        # process_format only stages the format; process_crawl does the merge
+        assert processor.results == []
+        assert processor.formats["txt"] == {
+            "extension": "txt",
+            "original_url": processor.crawlResult["url"],
+        }
         copied = processor.sDir / f"{processor.cTimestamp}.txt"
         assert copied.exists()
         assert processor.fileNames == [copied]
@@ -173,12 +178,13 @@ class TestProcessFormat:
     ):
         _, _c_dir, a_dir, _j_dir = crawl_dirs
         (a_dir / "capture.txt").write_text("hello")
-        monkeypatch.setattr(processor, "verify_content", lambda item, path: False)
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: False)
 
         processor.process_format(("txt", a_dir))
 
         assert processor.confirmedNew is False
         assert processor.failCounter == 1
+        assert processor.formats == {}
         assert processor.results == []
 
     def test_missing_file_increments_fail_counter(self, processor, crawl_dirs):
@@ -188,6 +194,7 @@ class TestProcessFormat:
         processor.process_format(("html", a_dir))
 
         assert processor.failCounter == 1
+        assert processor.formats == {}
         assert processor.results == []
 
     def test_confirmed_new_short_circuits_verify_content(
@@ -198,13 +205,15 @@ class TestProcessFormat:
         processor.confirmedNew = True
         calls = []
         monkeypatch.setattr(
-            processor, "verify_content", lambda item, path: calls.append(1) or False
+            processor,
+            "verify_content",
+            lambda fmt, url, path: calls.append(1) or False,
         )
 
         processor.process_format(("html", a_dir))
 
         assert calls == []
-        assert len(processor.results) == 1
+        assert processor.formats["html"]["extension"] == "html"
 
     def test_wacz_bypasses_verify_content_entirely(
         self, processor, crawl_dirs, monkeypatch
@@ -213,15 +222,19 @@ class TestProcessFormat:
         (c_dir / "archive.wacz").write_bytes(b"fake wacz")
         calls = []
         monkeypatch.setattr(
-            processor, "verify_content", lambda item, path: calls.append(1) or False
+            processor,
+            "verify_content",
+            lambda fmt, url, path: calls.append(1) or False,
         )
 
         processor.process_format(("wacz", c_dir))
 
         assert calls == []
-        assert len(processor.results) == 1
-        assert processor.results[0]["format"] == "warc"
-        assert processor.results[0]["path"].endswith(".wacz")
+        assert processor.results == []
+        assert processor.formats["warc"] == {
+            "extension": "wacz",
+            "original_url": processor.crawlResult["url"],
+        }
 
     def test_warc_json_branch_builds_and_writes_file(
         self, processor, crawl_dirs, monkeypatch
@@ -236,13 +249,12 @@ class TestProcessFormat:
             )
         )
         (j_dir / "extraPages.jsonl").write_text("")
-        monkeypatch.setattr(processor, "verify_content", lambda item, path: True)
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
 
         processor.process_format(("warc.json", j_dir))
 
         assert processor.failCounter == 0
-        assert len(processor.results) == 1
-        assert processor.results[0]["format"] == "warc.json"
+        assert processor.formats["warc.json"]["extension"] == "warc.json"
         written = j_dir / f"{processor.cTimestamp}.warc.json"
         assert written.exists()
         copied = processor.sDir / f"{processor.cTimestamp}.warc.json"
@@ -250,24 +262,24 @@ class TestProcessFormat:
 
 
 class TestVerifyContent:
-    def _item(self):
-        return {
-            "format": "txt",
-            "original_url": "https://example.com/privacy",
-            "company_id": "co1",
-            "type": "privacy_policy",
-        }
+    ORIGINAL_URL = "https://example.com/privacy"
 
     def test_returns_false_when_validation_fails(self, processor, monkeypatch):
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: False)
 
-        assert processor.verify_content(self._item(), Path("dummy.txt")) is False
+        assert (
+            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            is False
+        )
 
     def test_returns_true_when_no_previous_capture_mongo(self, processor, monkeypatch):
         CFG.USE_MONGO = True
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
 
-        assert processor.verify_content(self._item(), Path("dummy.txt")) is True
+        assert (
+            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            is True
+        )
 
     def test_compares_against_existing_capture_mongo(self, processor, monkeypatch):
         CFG.USE_MONGO = True
@@ -275,31 +287,149 @@ class TestVerifyContent:
             {
                 "company_id": "co1",
                 "type": "privacy_policy",
-                "format": "txt",
                 "date_fetched": "2024-01-01",
-                "path": "co1/privacy_policy/123.txt",
+                "path": "co1/privacy_policy/123",
+                "formats": {
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                },
             }
         )
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
         monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: True)
 
-        assert processor.verify_content(self._item(), Path("dummy.txt")) is True
+        assert (
+            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            is True
+        )
 
-    def test_uses_local_find_one_when_use_mongo_false(self, processor, monkeypatch):
+    def test_uses_local_find_when_use_mongo_false(self, processor, monkeypatch):
         CFG.USE_MONGO = False
         processor.collection = [
             {
                 "company_id": "co1",
                 "type": "privacy_policy",
-                "format": "txt",
                 "date_fetched": "2024-01-01",
-                "path": "co1/privacy_policy/123.txt",
+                "path": "co1/privacy_policy/123",
+                "formats": {
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                },
             }
         ]
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
         monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: False)
 
-        assert processor.verify_content(self._item(), Path("dummy.txt")) is False
+        assert (
+            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            is False
+        )
+
+    def test_matches_previous_capture_with_dotted_format_key_mongo(
+        self, processor, monkeypatch
+    ):
+        """Regression test: "warc.json" contains a literal "." in its
+        formats-dict key. A "formats.warc.json" query filter would get
+        parsed by MongoDB's dot-notation as the nested path
+        formats->warc->json, which this schema never has, so it would never
+        match -- verify_content must find candidates by (company_id, type)
+        only and check format membership in Python instead."""
+        CFG.USE_MONGO = True
+        processor.collection.docs.append(
+            {
+                "company_id": "co1",
+                "type": "privacy_policy",
+                "date_fetched": "2024-01-01",
+                "path": "co1/privacy_policy/123",
+                "formats": {
+                    "warc.json": {
+                        "extension": "warc.json",
+                        "original_url": self.ORIGINAL_URL,
+                    }
+                },
+            }
+        )
+        monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
+        # If verify_content wrongly took the "no previous capture" branch
+        # (the bug), it would return True regardless of this.
+        monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: False)
+
+        assert (
+            processor.verify_content(
+                "warc.json", self.ORIGINAL_URL, Path("dummy.warc.json")
+            )
+            is False
+        )
+
+    def test_matches_previous_capture_with_dotted_format_key_local_mode(
+        self, processor, monkeypatch
+    ):
+        CFG.USE_MONGO = False
+        processor.collection = [
+            {
+                "company_id": "co1",
+                "type": "privacy_policy",
+                "date_fetched": "2024-01-01",
+                "path": "co1/privacy_policy/123",
+                "formats": {
+                    "warc.json": {
+                        "extension": "warc.json",
+                        "original_url": self.ORIGINAL_URL,
+                    }
+                },
+            }
+        ]
+        monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
+        monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: False)
+
+        assert (
+            processor.verify_content(
+                "warc.json", self.ORIGINAL_URL, Path("dummy.warc.json")
+            )
+            is False
+        )
+
+    def test_skips_candidates_missing_the_requested_format(
+        self, processor, monkeypatch
+    ):
+        # The most recent capture overall (2024-02-01) doesn't have a "txt"
+        # format -- bestMatch should be the most recent capture that DOES
+        # have it, not just the single most recent document overall.
+        CFG.USE_MONGO = True
+        processor.collection.docs.extend(
+            [
+                {
+                    "company_id": "co1",
+                    "type": "privacy_policy",
+                    "date_fetched": "2024-01-01",
+                    "path": "co1/privacy_policy/1",
+                    "formats": {
+                        "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                    },
+                },
+                {
+                    "company_id": "co1",
+                    "type": "privacy_policy",
+                    "date_fetched": "2024-02-01",
+                    "path": "co1/privacy_policy/2",
+                    "formats": {
+                        "html": {
+                            "extension": "html",
+                            "original_url": self.ORIGINAL_URL,
+                        }
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
+        seen_paths = []
+        monkeypatch.setattr(
+            process_module,
+            "compare_files",
+            lambda local, gcp_path, fmt, bucket: seen_paths.append(gcp_path) or True,
+        )
+
+        processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+
+        assert seen_paths == ["co1/privacy_policy/1.txt"]
 
     def test_compare_exception_returns_false(self, processor, monkeypatch, caplog):
         CFG.USE_MONGO = True
@@ -307,9 +437,11 @@ class TestVerifyContent:
             {
                 "company_id": "co1",
                 "type": "privacy_policy",
-                "format": "txt",
                 "date_fetched": "2024-01-01",
-                "path": "co1/privacy_policy/123.txt",
+                "path": "co1/privacy_policy/123",
+                "formats": {
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                },
             }
         )
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
@@ -319,7 +451,201 @@ class TestVerifyContent:
 
         monkeypatch.setattr(process_module, "compare_files", boom)
 
-        assert processor.verify_content(self._item(), Path("dummy.txt")) is False
+        assert (
+            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            is False
+        )
+
+
+class TestReconstructMissingTxt:
+    def test_reconstructs_from_html_when_txt_missing(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        assert "txt" not in processor.formats
+
+        monkeypatch.setattr(
+            process_module,
+            "reconstruct_text_from_format",
+            lambda raw, fmt, ext, url: "Reconstructed policy text",
+        )
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.reconstruct_missing_txt()
+
+        assert processor.formats["txt"] == {
+            "extension": "txt",
+            "original_url": processor.crawlResult["url"],
+        }
+        newFile = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert newFile.exists()
+        assert newFile.read_text() == "Reconstructed policy text"
+        assert newFile in processor.fileNames
+
+    def test_respects_reconstruction_priority_order(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, c_dir, a_dir, j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        processor.process_format(("pdf", a_dir))
+        assert set(processor.formats.keys()) == {"html", "pdf"}
+
+        seen_formats = []
+
+        def fake_reconstruct(raw, fmt, ext, url):
+            seen_formats.append(fmt)
+            return "Some reconstructed text"
+
+        monkeypatch.setattr(
+            process_module, "reconstruct_text_from_format", fake_reconstruct
+        )
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.reconstruct_missing_txt()
+
+        # html outranks pdf in RECONSTRUCTION_FORMAT_PRIORITY, so it's tried
+        # (and succeeds) first -- pdf is never attempted.
+        assert seen_formats == ["html"]
+        assert processor.formats["txt"]["extension"] == "txt"
+
+    def test_falls_back_to_next_format_when_first_fails_validation(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        processor.process_format(("pdf", a_dir))
+
+        def fake_reconstruct(raw, fmt, ext, url):
+            return f"text from {fmt}"
+
+        monkeypatch.setattr(
+            process_module, "reconstruct_text_from_format", fake_reconstruct
+        )
+        # html's reconstructed text fails verification (bad quality/classifier
+        # score or no real change); pdf's succeeds. Both attempts write to
+        # the same {timestamp}.txt path, so distinguish by content instead.
+        monkeypatch.setattr(
+            processor,
+            "verify_content",
+            lambda fmt, url, path: path.read_text() == "text from pdf",
+        )
+
+        processor.reconstruct_missing_txt()
+
+        assert processor.formats["txt"]["extension"] == "txt"
+        newFile = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert newFile.read_text() == "text from pdf"
+        # The rejected html-sourced attempt should have been cleaned up, not
+        # left behind as a stray file.
+        assert newFile.exists()
+
+    def test_no_reconstruction_source_available_leaves_formats_unchanged(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, _c_dir, a_dir, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example", "text": "hello world"})
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: False)
+        processor.process_format(("warc.json", j_dir))
+        assert "warc.json" not in processor.formats
+
+        processor.reconstruct_missing_txt()
+
+        assert "txt" not in processor.formats
+        assert processor.fileNames == []
+
+    def test_empty_extracted_text_tries_next_format(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        processor.process_format(("pdf", a_dir))
+
+        def fake_reconstruct(raw, fmt, ext, url):
+            return "" if fmt == "html" else "text from pdf"
+
+        monkeypatch.setattr(
+            process_module, "reconstruct_text_from_format", fake_reconstruct
+        )
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.reconstruct_missing_txt()
+
+        assert processor.formats["txt"]["extension"] == "txt"
+        newFile = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert newFile.read_text() == "text from pdf"
+
+    def test_extraction_exception_tries_next_format(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        processor.process_format(("pdf", a_dir))
+
+        def fake_reconstruct(raw, fmt, ext, url):
+            if fmt == "html":
+                raise RuntimeError("extraction blew up")
+            return "text from pdf"
+
+        monkeypatch.setattr(
+            process_module, "reconstruct_text_from_format", fake_reconstruct
+        )
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.reconstruct_missing_txt()
+
+        assert processor.formats["txt"]["extension"] == "txt"
+
+    def test_verify_content_exception_tries_next_format(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        """verify_content isn't guarded by reconstruct_text_from_format's own
+        try/except -- an unexpected error there (e.g. a transient Mongo
+        error) must rule out this candidate format and move on, not
+        propagate out and lose every other already-validated format for
+        this document."""
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        processor.process_format(("html", a_dir))
+        processor.process_format(("pdf", a_dir))
+
+        monkeypatch.setattr(
+            process_module,
+            "reconstruct_text_from_format",
+            lambda raw, fmt, ext, url: f"text from {fmt}",
+        )
+
+        def flaky_verify_content(fmt, url, path):
+            if path.read_text() == "text from html":
+                raise RuntimeError("transient mongo error")
+            return True
+
+        monkeypatch.setattr(processor, "verify_content", flaky_verify_content)
+
+        processor.reconstruct_missing_txt()
+
+        assert processor.formats["txt"]["extension"] == "txt"
+        newFile = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert newFile.read_text() == "text from pdf"
 
 
 class TestProcessCrawlOrchestration:
@@ -363,3 +689,75 @@ class TestProcessCrawlOrchestration:
 
         assert len(results) == 5
         assert len(file_names) == 5
+
+    def test_merges_successful_formats_into_a_single_document(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        _, c_dir, a_dir, j_dir = crawl_dirs
+        (a_dir / "capture.txt").write_text("hello")
+        (a_dir / "capture.html").write_text("<html></html>")
+        (a_dir / "capture.pdf").write_bytes(b"%PDF-fake")
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example", "text": "hello world"})
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+        (c_dir / "archive.wacz").write_bytes(b"fake wacz")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        results, file_names = processor.process_crawl()
+
+        assert len(results) == 1
+        doc = results[0]
+        assert doc["company_id"] == "co1"
+        assert doc["type"] == "privacy_policy"
+        assert "." not in Path(doc["path"]).name
+        assert doc["public_url"].endswith(doc["path"])
+        assert set(doc["formats"].keys()) == {"txt", "html", "pdf", "warc.json", "warc"}
+        assert doc["formats"]["warc"] == {
+            "extension": "wacz",
+            "original_url": processor.crawlResult["url"],
+        }
+        assert len(file_names) == 5
+
+    def test_backfills_txt_when_crawl_produced_no_txt_directly(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        # No capture.txt this time -- only html is available.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.html").write_text("<html></html>")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+        monkeypatch.setattr(
+            process_module,
+            "reconstruct_text_from_format",
+            lambda raw, fmt, ext, url: "Reconstructed from html",
+        )
+
+        results, file_names = processor.process_crawl()
+
+        assert len(results) == 1
+        doc = results[0]
+        assert doc["formats"]["txt"] == {
+            "extension": "txt",
+            "original_url": processor.crawlResult["url"],
+        }
+        newTxt = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert newTxt in file_names
+        assert newTxt.read_text() == "Reconstructed from html"
+
+    def test_does_not_attempt_backfill_when_nothing_was_captured(
+        self, processor, monkeypatch
+    ):
+        # Every format fails to be found at all -- process.py should not try
+        # to reconstruct a .txt from thin air.
+        calls = []
+        monkeypatch.setattr(
+            process_module,
+            "reconstruct_text_from_format",
+            lambda *a, **k: calls.append(1) or "",
+        )
+
+        results, file_names = processor.process_crawl()
+
+        assert results == []
+        assert file_names == []
+        assert calls == []

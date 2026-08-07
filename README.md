@@ -71,16 +71,35 @@ Example `document` database entry:
     "$oid": "67784259cef22046ad5f727c"
   },
   "company_id": "675211559efd527760c64414",
-  "path": "company_id/type/unix_timestamp.txt",
   "type": "community_guidelines",
   "date_fetched": {
     "$date": "2025-01-03T20:02:32.024Z"
   },
-  "public_url": "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp.format",
-  "original_url": "https://company.com/type",
-  "format": "txt"
+  "path": "company_id/type/unix_timestamp",
+  "public_url": "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp",
+  "formats": {
+    "txt": {
+      "extension": "txt",
+      "original_url": "https://company.com/type"
+    },
+    "html": {
+      "extension": "html",
+      "original_url": "https://company.com/type"
+    }
+  }
 }
 ```
+
+A single capture (one company, document type, and `date_fetched`) is stored as **one** document. `path` and `public_url` are the base location with no file extension; `formats` lists whichever of the 5 formats (`txt`, `html`, `pdf`, `warc`, `warc.json`) were actually captured, each with its own `extension` (this matters because a given format hasn't always mapped to the same file extension over the project's history -- `warc` in particular) and its own `original_url` (almost always identical across formats, but occasionally a format like `pdf` is fetched from a distinct link).
+
+**To get the downloadable link for a specific format**, append a dot and that format's `extension` to `public_url`. For example, to get the `html` capture above:
+
+```text
+public_url + "." + formats["html"]["extension"]
+= "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp.html"
+```
+
+If you're working in a spreadsheet rather than code, this is just string concatenation: `=CONCATENATE(public_url, ".", extension)` once you've pulled a format's `extension` out into its own column.
 
 ### MongoDB Compass ([Mongo website](https://www.mongodb.com/compass))
 
@@ -124,6 +143,10 @@ The .html of the primary target url is provided as a closer-to-text format that 
 ### TXT
 
 The .txt format is provided for easy data access, parsing, and comparison.  This is a simple text parse of the client-side html at time of capture, and may include non-document content such as headers, footers, or pop-ups.
+
+If a capture doesn't produce a .txt directly, the pipeline backfills one by extracting text from whichever other format it did capture (preferring html, then pdf, then warc.json, then the raw warc/wacz as a last resort), so a .txt is available for nearly every archived document.
+
+Every .txt capture -- direct or backfilled -- is checked against a trained classifier (`source/policy_classifier.py`) that estimates whether it's actually a policy document as opposed to a bad capture (homepage, cookie wall, 404 page, login wall, ...). This is controlled by `USE_POLICY_CLASSIFIER`/`POLICY_CLASSIFIER_THRESHOLD` in `config.yaml` and requires a trained model at `models/policy_classifier.joblib` (see `scripts/build_policy_dataset.py` and `scripts/train_policy_classifier.py`).
 
 ### Other formats
 

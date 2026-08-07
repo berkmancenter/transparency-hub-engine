@@ -26,6 +26,8 @@ def write_config(tmp_path, overrides=None):
         "TOPIC_PATTERNS": {"Cookies": [r"\bcookies?\b"]},
         "PRIORITY_DICT": {"abc123": 3},
         "USE_SLACK": False,
+        "USE_POLICY_CLASSIFIER": True,
+        "POLICY_CLASSIFIER_THRESHOLD": 0.3,
     }
     if overrides:
         config.update(overrides)
@@ -69,6 +71,8 @@ class TestAppConfigDefaults:
         assert cfg.RECOVERY_DATA == []
         assert cfg.TOPIC_PATTERNS == {}
         assert cfg.PRIORITY_DICT == {}
+        assert cfg.USE_POLICY_CLASSIFIER is True
+        assert cfg.POLICY_CLASSIFIER_THRESHOLD == 0.3
 
     def test_mutable_defaults_are_independent_per_instance(self):
         a, b = AppConfig(), AppConfig()
@@ -242,6 +246,8 @@ class TestConfigYamlLoading:
         assert CFG.CREATE_CHANGES is True
         assert CFG.PRIORITY_DICT == {"abc123": 3}
         assert CFG.USE_SLACK is False
+        assert CFG.USE_POLICY_CLASSIFIER is True
+        assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.3
         assert "Cookies" in CFG.TOPIC_PATTERNS
         pattern = CFG.TOPIC_PATTERNS["Cookies"][0]
         assert pattern.search("We use Cookies.") is not None
@@ -264,6 +270,23 @@ class TestConfigYamlLoading:
         assert CFG.PRIORITY_DICT == {}
         assert CFG.USE_SLACK is False
         assert CFG.USE_LOCAL_COMPANIES is False
+        assert CFG.USE_POLICY_CLASSIFIER is True
+        assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.3
+
+    def test_policy_classifier_settings_loaded_from_config(self, monkeypatch, tmp_path):
+        config_path = write_config(
+            tmp_path,
+            overrides={
+                "USE_POLICY_CLASSIFIER": False,
+                "POLICY_CLASSIFIER_THRESHOLD": 0.5,
+            },
+        )
+        monkeypatch.setattr(sys, "argv", base_argv(tmp_path, config_path))
+
+        init_globals()
+
+        assert CFG.USE_POLICY_CLASSIFIER is False
+        assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.5
 
     def test_use_gcp_forced_false_in_cloud_mode(self, monkeypatch, tmp_path):
         monkeypatch.setenv("CLOUD_RUN_EXECUTION", "1")

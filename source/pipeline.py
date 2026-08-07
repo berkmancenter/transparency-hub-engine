@@ -38,7 +38,7 @@ class DocumentPipeline:
         if CFG.USE_MONGO:
             logger.info("Connecting to MongoDB...")
             self.mongoClient = mongo_connect()
-            self.collection = self.mongoClient[CFG.DB_NAME]["documents"]
+            self.collection = self.mongoClient[CFG.DB_NAME]["documents_v2"]
         else:
             self.collection = pull_db(CFG.DOCUMENTS_BSON)
         self.googleClient = None
@@ -110,7 +110,9 @@ class DocumentPipeline:
 
             # Notify slack
             if len(mongoData) > 0:
-                new_ids = [m["company_id"] for m in mongoData if m["format"] == "txt"]
+                new_ids = [
+                    m["company_id"] for m in mongoData if "txt" in m.get("formats", {})
+                ]
                 try:
                     # Only notify slack if the company has a new text capture
                     for pData in companyData["pValues"]:

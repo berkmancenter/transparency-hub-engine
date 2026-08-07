@@ -590,6 +590,45 @@ class TestSaveAndPullDb:
 
 
 # --------------------------------------------------------------------------
+# local_find
+# --------------------------------------------------------------------------
+
+
+class TestLocalFind:
+    def test_returns_every_match(self):
+        db = [{"a": 1, "v": 1}, {"a": 1, "v": 2}, {"a": 2, "v": 3}]
+        assert utils.local_find(db, {"a": 1}) == [{"a": 1, "v": 1}, {"a": 1, "v": 2}]
+
+    def test_returns_empty_list_when_no_match(self):
+        assert utils.local_find([{"a": 1}], {"a": 2}) == []
+
+    def test_sorts_all_matches(self):
+        db = [{"v": 3}, {"v": 1}, {"v": 2}]
+        assert utils.local_find(db, {}, sort=[("v", -1)]) == [
+            {"v": 3},
+            {"v": 2},
+            {"v": 1},
+        ]
+
+    def test_dotted_key_with_literal_dot_in_field_name_is_not_a_nested_path(self):
+        """A doc whose "formats" dict has a key that itself contains a "."
+        (e.g. "warc.json") can't be matched via a "formats.warc.json" query
+        -- that gets parsed as the nested path formats->warc->json, not the
+        single literal key "warc.json". Membership must be checked in
+        plain Python instead (`mongoFormat in doc.get("formats", {})`),
+        which is exactly why source.process.ProcessCrawl.verify_content
+        no longer folds the format-presence check into the query itself."""
+        db = [
+            {"company_id": "co1", "formats": {"warc.json": {"extension": "warc.json"}}}
+        ]
+
+        assert utils.local_find(db, {"formats.warc.json": {"$exists": True}}) == []
+        assert [
+            d for d in utils.local_find(db, {}) if "warc.json" in d["formats"]
+        ] == db
+
+
+# --------------------------------------------------------------------------
 # local_find_one
 # --------------------------------------------------------------------------
 
@@ -619,6 +658,30 @@ class TestLocalFindOne:
         ]
         result = utils.local_find_one(db, {}, sort=[("group", 1), ("v", 1)])
         assert result == {"group": "a", "v": 1}
+
+    def test_exists_operator_matches_nested_dotted_key(self):
+        db = [
+            {"company_id": "co1", "formats": {"txt": {"extension": "txt"}}},
+            {"company_id": "co2", "formats": {"html": {"extension": "html"}}},
+        ]
+        result = utils.local_find_one(db, {"formats.txt": {"$exists": True}})
+        assert result == db[0]
+
+    def test_exists_false_matches_when_dotted_key_absent(self):
+        db = [
+            {"company_id": "co1", "formats": {"txt": {"extension": "txt"}}},
+            {"company_id": "co2", "formats": {"html": {"extension": "html"}}},
+        ]
+        result = utils.local_find_one(db, {"formats.txt": {"$exists": False}})
+        assert result == db[1]
+
+
+class TestMatchesQuery:
+    def test_dotted_key_traverses_nested_dicts(self):
+        assert utils.get_nested({"a": {"b": 1}}, "a.b") == 1
+
+    def test_dotted_key_missing_intermediate_returns_none(self):
+        assert utils.get_nested({"a": 1}, "a.b") is None
 
 
 # --------------------------------------------------------------------------

@@ -57,6 +57,9 @@ class AppConfig:
     CREATE_CHANGES: bool = True
     TOPIC_PATTERNS: dict = field(default_factory=dict)
     PRIORITY_DICT: dict = field(default_factory=dict)
+    # Policy-document classifier (source/policy_classifier.py)
+    USE_POLICY_CLASSIFIER: bool = True
+    POLICY_CLASSIFIER_THRESHOLD: float = 0.3
     # Slack Notifications
     USE_SLACK: bool = False
     SLACK_WEBHOOK_URL: str = ""
@@ -226,6 +229,8 @@ def init_globals():
             for topic, patterns in config.get("TOPIC_PATTERNS", {}).items()
         }
         CFG.PRIORITY_DICT = config.get("PRIORITY_DICT", {})
+        CFG.USE_POLICY_CLASSIFIER = config.get("USE_POLICY_CLASSIFIER", True)
+        CFG.POLICY_CLASSIFIER_THRESHOLD = config.get("POLICY_CLASSIFIER_THRESHOLD", 0.3)
         CFG.USE_SLACK = config.get("USE_SLACK", False)
         CFG.SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
     except Exception as e:
@@ -304,6 +309,8 @@ def init_globals():
           MAX_WORKERS = {CFG.MAX_WORKERS}
           TIMEOUT = {CFG.TIMEOUT}
           CREATE_CHANGES = {CFG.CREATE_CHANGES}
+          USE_POLICY_CLASSIFIER = {CFG.USE_POLICY_CLASSIFIER}
+          {"POLICY_CLASSIFIER_THRESHOLD = " + str(CFG.POLICY_CLASSIFIER_THRESHOLD) if CFG.USE_POLICY_CLASSIFIER else "None"}
           {"Topic Patterns are set in the config file" if CFG.TOPIC_PATTERNS != {} else "Topic Patterns are not set in the config file"}
           {"Priority Dictionary is set in the config file: " + str(CFG.PRIORITY_DICT) if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
           

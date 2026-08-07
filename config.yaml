@@ -59,6 +59,22 @@ USE_SLACK: false
 # Defaults to true
 CREATE_CHANGES: true
 
+# Whether to run the trained policy-document classifier (source/policy_classifier.py)
+# against every new .txt capture -- live or reconstructed from another format when the
+# crawl itself didn't produce a .txt (see source/process.py ProcessCrawl.reconstruct_missing_txt) --
+# and reject captures it's confident are NOT an actual policy document (homepage, cookie
+# wall, 404 page, login wall, ...).
+# Requires a trained model at models/policy_classifier.joblib -- see scripts/train_policy_classifier.py
+# and scripts/build_policy_dataset.py. If USE_POLICY_CLASSIFIER is true but the model can't be
+# loaded, the check fails open (the capture is allowed through) rather than blocking every capture.
+# Defaults to true
+USE_POLICY_CLASSIFIER: true
+
+# Policy-document probability threshold used by USE_POLICY_CLASSIFIER.
+# Captures scoring below this are rejected as non-policy documents.
+# Defaults to 0.3, matching the threshold validated in scripts/find_bad_captures.py
+POLICY_CLASSIFIER_THRESHOLD: 0.3
+
 # Prioritization of the selected companies to establish frequency of captures
 # The higher the value, the more frequently the capture will be made
 # The lower the value, the less frequently the capture will be made

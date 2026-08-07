@@ -5,12 +5,18 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import os
 import shutil
 
 # Local Imports
 from .globals import CFG, logger
-from .utils import join_path, local_find_one
-from .async_compare import compare_files, validate_file
+from .utils import join_path, local_find
+from .async_compare import (
+    compare_files,
+    validate_file,
+    reconstruct_text_from_format,
+    RECONSTRUCTION_FORMAT_PRIORITY,
+)
 
 if CFG.USE_MONGO:
     from pymongo.collection import Collection
@@ -54,12 +60,12 @@ class ProcessCrawl:
             "type": self.crawlResult["pType"],
             "date_fetched": cDateObj,
             "public_url": f"https://storage.googleapis.com/{CFG.GCP_BUCKET}/{self.crawlResult['objId']}/{self.crawlResult['pType']}/{self.cTimestamp}",
-            "original_url": self.crawlResult["url"],
         }
 
         # Initialize variables that update during process_crawl
         self.confirmedNew = False
         self.failCounter = 0
+        self.formats = {}
         self.results = []
         self.fileNames = []
 
@@ -90,7 +96,16 @@ class ProcessCrawl:
         else:
             logger.info("All other formats failed, skipping wacz file")
 
-        # All processing is complete, return itemInfo objects and file names
+        # The crawl didn't produce a .txt directly -- try to backfill one from
+        # whatever other format was captured, so a .txt is available for
+        # nearly every archived document
+        if self.formats and "txt" not in self.formats:
+            self.reconstruct_missing_txt()
+
+        # All processing is complete, merge any captured formats into a single document
+        if self.formats:
+            self.results.append({**self.genItemInfo, "formats": self.formats})
+
         return self.results, self.fileNames
 
     def process_format(self, formatObj: tuple):
@@ -123,44 +138,112 @@ class ProcessCrawl:
                 else:
                     raise Exception(f"No {iFormat} file created during capture")
 
-            # Write format specific information into a copy of itemInfo
-            itemInfo = self.genItemInfo.copy()
-            itemInfo["format"] = f"{iFormat}"
             # WACZ files are refered to by their unzipped name, WARC, in the format field of the Document collection
-            if iFormat == "wacz":
-                itemInfo["format"] = "warc"
-            itemInfo["path"] += f".{iFormat}"
-            itemInfo["public_url"] += f".{iFormat}"
+            mongoFormat = "warc" if iFormat == "wacz" else iFormat
+            originalUrl = self.crawlResult["url"]
 
             # Verify the file has changes, bypass for wacz file
             if (
                 iFormat == "wacz"
                 or self.confirmedNew
-                or self.verify_content(itemInfo, cTypeFile)
+                or self.verify_content(mongoFormat, originalUrl, cTypeFile)
             ):
                 # Confirmed that this is a new capture
                 logger.info(
-                    f"Found new {iFormat} file for {itemInfo['original_url']}, will add capture data to database..."
+                    f"Found new {iFormat} file for {originalUrl}, will add capture data to database..."
                 )
 
                 # Copy the file into sDir and add capture info to return lists
                 newFilePath = join_path(self.sDir, f"{self.cTimestamp}.{iFormat}")
                 shutil.copy(cTypeFile, newFilePath)
-                self.results.append(itemInfo)
+                self.formats[mongoFormat] = {
+                    "extension": iFormat,
+                    "original_url": originalUrl,
+                }
                 self.fileNames.append(newFilePath)
 
                 if iFormat == "txt":
                     # Set confirmed_new since the .txt should be an accurate indicator across all other existing formats
                     self.confirmedNew = True
             else:
-                logger.info(f"No new {iFormat} file for {itemInfo['original_url']}")
+                logger.info(f"No new {iFormat} file for {originalUrl}")
                 self.failCounter += 1
         except Exception as e:
             # Continue to try to find other formats
             logger.error(
-                f"Failed to find/copy {iFormat} file for {self.genItemInfo['original_url']}: {e}"
+                f"Failed to find/copy {iFormat} file for {self.crawlResult['url']}: {e}"
             )
             self.failCounter += 1
+
+    def reconstruct_missing_txt(self):
+        """
+        Backfills a .txt capture for this document when the crawl itself
+        didn't produce one, extracting text from whichever other format was
+        captured instead (mirrors scripts/reconstruct_missing_txt.py's
+        offline backfill logic, so the live pipeline and that script stay
+        consistent). Tries formats in RECONSTRUCTION_FORMAT_PRIORITY order
+        (html > pdf > warc.json > warc) and stops at the first one that
+        yields text passing the same validation and change-detection checks
+        a directly captured .txt would go through.
+        """
+        originalUrl = self.crawlResult["url"]
+
+        for rFormat in RECONSTRUCTION_FORMAT_PRIORITY:
+            if rFormat not in self.formats:
+                continue
+
+            extension = self.formats[rFormat]["extension"]
+            sourcePath = join_path(self.sDir, f"{self.cTimestamp}.{extension}")
+            try:
+                with open(sourcePath, "rb") as f:
+                    rawBytes = f.read()
+                text = reconstruct_text_from_format(
+                    rawBytes, rFormat, extension, originalUrl
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to reconstruct .txt from {rFormat} for {originalUrl}: {e}"
+                )
+                continue
+
+            if not text or not text.strip():
+                continue
+
+            newFilePath = join_path(self.sDir, f"{self.cTimestamp}.txt")
+            with open(newFilePath, "w", encoding="utf-8") as f:
+                f.write(text)
+
+            try:
+                # verify_content isn't wrapped in try/except the way
+                # process_format wraps its own call to it -- guard it here
+                # too, so an unexpected error (e.g. a transient Mongo
+                # error) just rules out this candidate format instead of
+                # propagating out of process_crawl and losing every other
+                # format already validated for this document.
+                verified = self.verify_content("txt", originalUrl, newFilePath)
+            except Exception as e:
+                logger.error(
+                    f"verify_content failed for .txt reconstructed from {rFormat} "
+                    f"for {originalUrl}: {e}"
+                )
+                verified = False
+
+            if verified:
+                logger.info(
+                    f"Reconstructed .txt capture for {originalUrl} from {rFormat}"
+                )
+                self.formats["txt"] = {"extension": "txt", "original_url": originalUrl}
+                self.fileNames.append(newFilePath)
+                return
+
+            # Reconstructed text failed validation, or wasn't a real change
+            # from the most recent existing .txt capture -- discard it and
+            # try the next best available format
+            os.remove(newFilePath)
+
+        logger.info(
+            f"Could not reconstruct a .txt capture for {originalUrl} from any available format"
+        )
 
     def create_warc_json(self, pagesFile: Path, extraPagesFile: Path):
         """
@@ -232,13 +315,14 @@ class ProcessCrawl:
         }
         return warcJson
 
-    def verify_content(self, item: dict, cPath: Path) -> bool:
+    def verify_content(self, mongoFormat: str, originalUrl: str, cPath: Path) -> bool:
         """
         A wrapper function for compare.py that checks to see if a prior version of this document can be located in the existing document store, and then analyzes them for changes
         It also validates the file to ensure it matches the expectations of a successful captured document
 
         Args:
-          item (dict): A dictionary of capture relevant item info in the same structure as the Document collection
+          mongoFormat (str): The format key as stored under a document's "formats" dict (e.g. "warc" for wacz files)
+          originalUrl (str): The source URL this capture was fetched from, used for logging
           cPath (Path): A Path to the local file containing the new capture in the specified format
 
         Returns:
@@ -246,39 +330,49 @@ class ProcessCrawl:
         """
 
         # Do a simple quality check on the capture
-        if not validate_file(cPath, item["format"]):
+        if not validate_file(cPath, mongoFormat):
             logger.info(
-                f"Failed to validate content for {item['original_url']}, rejecting capture"
+                f"Failed to validate content for {originalUrl}, rejecting capture"
             )
             return False
 
-        # Match company_id, type, and format, and return the most recent capture
+        # Match company_id and type, and return the most recent capture that
+        # has this format. The "has this format" check is done here in
+        # Python rather than via a "formats.<mongoFormat>" query filter --
+        # mongoFormat can contain a literal "." (e.g. "warc.json"), which
+        # both MongoDB's and local_find's dot-notation would otherwise
+        # misparse as a nested path (formats -> warc -> json) rather than a
+        # single key literally named "warc.json", so that filter would never
+        # match and this format's change-detection would be silently
+        # bypassed every time.
         query = {
-            "company_id": item["company_id"],
-            "type": item["type"],
-            "format": item["format"],
+            "company_id": self.genItemInfo["company_id"],
+            "type": self.genItemInfo["type"],
         }
         sort = [("date_fetched", -1)]
         if CFG.USE_MONGO:
-            bestMatch = self.collection.find_one(query, sort=sort)  # type: ignore
+            candidates = self.collection.find(query, sort=sort)  # type: ignore
         else:
-            bestMatch = local_find_one(self.collection, query, sort=sort)  # type: ignore
+            candidates = local_find(self.collection, query, sort=sort)  # type: ignore
+        bestMatch = next(
+            (doc for doc in candidates if mongoFormat in doc.get("formats", {})), None
+        )
         if bestMatch is None:
             # No previous capture was found, save this capture
             logger.info(
-                f"No previous capture found for {item['original_url']}, okay to push to Mongo and GCP..."
+                f"No previous capture found for {originalUrl}, okay to push to Mongo and GCP..."
             )
             return True
         else:
             try:
                 # Compare the local file with the GCP file using compare.py
-                return compare_files(
-                    cPath, bestMatch["path"], item["format"], self.googleBucket
-                )
+                bestExtension = bestMatch["formats"][mongoFormat]["extension"]
+                bestPath = f"{bestMatch['path']}.{bestExtension}"
+                return compare_files(cPath, bestPath, mongoFormat, self.googleBucket)
             except Exception as e:
                 # If comparison fails, do not push the new capture, and log failure
                 logger.error(
-                    f"Compare funcion failed for {item['format']} file for {item['original_url']}: {e}"
+                    f"Compare funcion failed for {mongoFormat} file for {originalUrl}: {e}"
                 )
                 logger.error(
                     "This file will not be saved to the document store or database"

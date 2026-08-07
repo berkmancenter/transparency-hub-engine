@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from source.globals import CFG, logger
+from source.utils import matches_query
 
 
 @pytest.fixture(autouse=True)
@@ -157,15 +158,25 @@ class FakeCollection:
             aggregate_result if aggregate_result is not None else []
         )
         self.aggregate_calls = []
+        self.find_calls = []
         self.find_one_calls = []
         self.inserted = []
 
-    def find(self):
-        return FakeCursor(self.docs)
+    def find(self, query=None, sort=None):
+        self.find_calls.append((query, sort))
+        results = (
+            list(self.docs)
+            if query is None
+            else [d for d in self.docs if matches_query(d, query)]
+        )
+        if sort:
+            for key, direction in reversed(sort):
+                results.sort(key=lambda d: d[key], reverse=(direction == -1))
+        return FakeCursor(results)
 
     def find_one(self, query, sort=None):
         self.find_one_calls.append((query, sort))
-        results = [d for d in self.docs if all(d.get(k) == v for k, v in query.items())]
+        results = [d for d in self.docs if matches_query(d, query)]
         if sort:
             for key, direction in reversed(sort):
                 results.sort(key=lambda d: d[key], reverse=(direction == -1))

@@ -411,13 +411,13 @@ def create_changes_json(idSet: set | None = None):
     if CFG.USE_MONGO:
         logger.info("Connecting to MongoDB...")
         mongoClient = mongo_connect()
-        collection = mongoClient[CFG.DB_NAME]["documents"]
+        collection = mongoClient[CFG.DB_NAME]["documents_v2"]
         mongoChangesDB = mongoClient[CFG.DB_NAME]["changes"]
         # Mongo pipeline to structure the documents data for creating Change files
         pipeline = [
             {
                 "$match": {
-                    "format": "txt",
+                    "formats.txt": {"$exists": True},
                     # Filter by the company IDs, if provided by idSet
                     **({"company_id": {"$in": idList}} if idList else {}),
                 }
@@ -428,7 +428,6 @@ def create_changes_json(idSet: set | None = None):
                     "_id": {
                         "company_id": "$company_id",
                         "type": "$type",
-                        "format": "$format",
                     },
                     "captures": {
                         "$push": {
@@ -448,21 +447,21 @@ def create_changes_json(idSet: set | None = None):
         def local_aggregate(
             documents: list[dict], id_set: set | None = None
         ) -> list[dict]:
-            # $match: filter by format and optionally by company_id
+            # $match: filter by presence of a txt format and optionally by company_id
             matched = [
                 doc
                 for doc in documents
-                if doc.get("format") == "txt"
+                if "txt" in doc.get("formats", {})
                 and (id_set is None or doc.get("company_id") in id_set)
             ]
 
             # $sort: sort by date_fetched ascending
             sorted_docs = sorted(matched, key=lambda d: d["date_fetched"])
 
-            # $group: group by (company_id, type, format), pushing capture fields
+            # $group: group by (company_id, type), pushing capture fields
             groups: dict[tuple, list] = {}
             for doc in sorted_docs:
-                key = (doc.get("company_id"), doc.get("type"), doc.get("format"))
+                key = (doc.get("company_id"), doc.get("type"))
                 groups.setdefault(key, []).append(
                     {
                         "_id": doc["_id"],
@@ -474,10 +473,10 @@ def create_changes_json(idSet: set | None = None):
             # Shape the output to match MongoDB's $group result structure
             return [
                 {
-                    "_id": {"company_id": company_id, "type": type_, "format": format_},
+                    "_id": {"company_id": company_id, "type": type_},
                     "captures": captures,
                 }
-                for (company_id, type_, format_), captures in groups.items()
+                for (company_id, type_), captures in groups.items()
             ]
 
         grouped_captures = local_aggregate(collection, idSet)
@@ -496,15 +495,14 @@ def create_changes_json(idSet: set | None = None):
     for group in grouped_captures:
         companyId = group["_id"]["company_id"]
         docType = group["_id"]["type"]
-        format = group["_id"]["format"]
         captures = group["captures"]
 
         # If there's only one capture in this set of documents no Change document can be made
-        logger.info(f"Company ID: {companyId}, Type: {docType}, Format: {format}...")
+        logger.info(f"Company ID: {companyId}, Type: {docType}...")
         logger.info(f"Number of captures: {len(captures)}...")
         if len(captures) <= 1:
             logger.error(
-                f"No potential changes for company_id: {companyId}, type: {docType}, format: {format}"
+                f"No potential changes for company_id: {companyId}, type: {docType}"
             )
             continue
 
@@ -538,7 +536,7 @@ def create_changes_json(idSet: set | None = None):
         if len(validCaptures) <= 1:
             # After reducing to only valid captures, there was only one version
             logger.error(
-                f"No valid potential changes for company_id: {companyId}, type: {docType}, format: {format}"
+                f"No valid potential changes for company_id: {companyId}, type: {docType}"
             )
             continue
 
@@ -563,13 +561,14 @@ def create_changes_json(idSet: set | None = None):
                 if changeExists:
                     # This change does exist, we don't need to rebuild it
                     logger.info(
-                        f"Change already exists for company_id: {companyId}, type: {docType}, format: {format}, older_capture: {olderCapture['_id']}, newer_capture: {newerCapture['_id']}..."
+                        f"Change already exists for company_id: {companyId}, type: {docType}, older_capture: {olderCapture['_id']}, newer_capture: {newerCapture['_id']}..."
                     )
                 else:
                     # This is a new change that needs to be created
                     # Pull the data from the GCP bucket
-                    olderPath = olderCapture["path"]
-                    newerPath = newerCapture["path"]
+                    # The txt extension is always "txt" regardless of any historical drift in other formats
+                    olderPath = f"{olderCapture['path']}.txt"
+                    newerPath = f"{newerCapture['path']}.txt"
 
                     # Check cache before fetching from GCS
                     olderText = doc_cache.get(olderPath)

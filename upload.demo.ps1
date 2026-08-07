@@ -7,7 +7,7 @@ $ProjectID   = "my-project-1234"
 $Region      = "us-east4"
 $Repository  = "document-capture"
 $ImageName   = "document_capture"
-$ImageTag    = "2.1"
+$ImageTag    = "2.2"
 
 # Construct the full Artifact Registry path
 $FullImagePath = "${Region}-docker.pkg.dev/${ProjectID}/${Repository}/${ImageName}:${ImageTag}"

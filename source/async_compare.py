@@ -296,6 +296,108 @@ def compare_json_files(gcsBytes: bytes, localPath: Path) -> bool:
     return has_content_changed(extract_json_text(localJson), extract_json_text(gcsJson))
 
 
+def passes_policy_document_check(text: str) -> bool:
+    """
+    Runs the trained policy-document classifier (source/policy_classifier.py)
+    against text destined to become a .txt capture (whether captured directly
+    or reconstructed from another format), rejecting captures the model is
+    confident are NOT an actual policy document (homepage, cookie wall, 404
+    page, login wall, ...).
+
+    Fails open (returns True) if CFG.USE_POLICY_CLASSIFIER is False or if the
+    classifier can't be loaded/run, so a missing or broken model file
+    degrades to pre-classifier behavior instead of blocking every capture.
+
+    Args:
+      text (str): The candidate .txt document text to classify.
+
+    Returns:
+      bool: True if the text should be treated as a valid policy document.
+    """
+    if not CFG.USE_POLICY_CLASSIFIER:
+        return True
+    try:
+        from source.policy_classifier import is_policy_document
+
+        return is_policy_document(text, threshold=CFG.POLICY_CLASSIFIER_THRESHOLD)
+    except Exception as e:
+        logger.warning(
+            f"Policy-document classifier check failed, allowing capture through: {e}"
+        )
+        return True
+
+
+RECONSTRUCTION_FORMAT_PRIORITY = ["html", "pdf", "warc.json", "warc"]
+
+
+def extract_text_from_pdf_bytes(rawBytes: bytes) -> str:
+    """
+    Extracts text from raw PDF bytes.
+
+    Args:
+      rawBytes (bytes): The raw bytes of a PDF file.
+
+    Returns:
+      str: The extracted text.
+    """
+    reader = PyPDF2.PdfReader(io.BytesIO(rawBytes))
+    return "".join(page.extract_text() for page in reader.pages)
+
+
+def extract_text_from_warc_json_bytes(rawBytes: bytes, originalUrl: str = "") -> str:
+    """
+    Extracts text from a warc.json file's raw bytes. warc.json's "records"
+    list has one entry per unique page visited during the crawl, so this
+    prefers the record whose urls include originalUrl (the actual target
+    page) over blindly concatenating every page the crawler happened to visit.
+
+    Args:
+      rawBytes (bytes): The raw bytes of a warc.json file.
+      originalUrl (str): The document's own source URL, used to select the
+        matching record. If omitted or not found, every record is joined.
+
+    Returns:
+      str: The extracted text.
+    """
+    data = json.loads(rawBytes)
+    records = data.get("records", [])
+    for record in records:
+        if originalUrl and originalUrl in record.get("urls", []):
+            return record.get("content", "")
+    return "\n\n".join(record.get("content", "") for record in records)
+
+
+def reconstruct_text_from_format(
+    rawBytes: bytes, format: str, extension: str, originalUrl: str = ""
+) -> str:
+    """
+    Extracts text from an already-captured format, used to backfill a
+    missing .txt capture when the crawl itself didn't produce one directly.
+
+    Args:
+      rawBytes (bytes): The raw bytes of the already-captured format's file.
+      format (str): The format key to reconstruct from ("html", "pdf",
+        "warc.json", or "warc").
+      extension (str): The file extension of the captured format, used to
+        distinguish "warc" stored as .wacz vs .warc.gz.
+      originalUrl (str): The document's own source URL, used to disambiguate
+        warc.json records.
+
+    Returns:
+      str: The extracted text, or an empty string for an unrecognized format.
+    """
+    if format == "html":
+        return read_text_from_html(rawBytes)
+    if format == "pdf":
+        return extract_text_from_pdf_bytes(rawBytes)
+    if format == "warc.json":
+        return extract_text_from_warc_json_bytes(rawBytes, originalUrl)
+    if format == "warc":
+        mode = "warc.gz" if extension.endswith("warc.gz") else "wacz"
+        return read_wacz_file(rawBytes, mode)
+    return ""
+
+
 def data_quality_check(text: Optional[str]) -> bool:
     # If the text is None or empty, return False
     if text is None or len(text.strip()) == 0:
@@ -382,10 +484,22 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
             if "content" in record:
                 text += record["content"]
 
-    return data_quality_check(text)
+    if not data_quality_check(text):
+        return False
+
+    if format == "txt":
+        # Only the txt format runs the classifier -- it was trained on text
+        # captured directly by the live pipeline, and running it against
+        # text extracted here from html/pdf/warc.json purely for quality
+        # checking would feed it a noisier distribution than it was trained on.
+        return passes_policy_document_check(text)
+
+    return True
 
 
-async def validate_file_async(localPath: Path, format: str, timeout: float = 300) -> bool:
+async def validate_file_async(
+    localPath: Path, format: str, timeout: float = 300
+) -> bool:
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(

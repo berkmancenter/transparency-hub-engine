@@ -10,3 +10,5 @@ PyYAML==6.0.2
 rapidfuzz==3.14.3
 google-cloud-storage==3.4.1
 google-cloud-run==0.16.0
+scikit-learn==1.9.0
+joblib==1.5.3

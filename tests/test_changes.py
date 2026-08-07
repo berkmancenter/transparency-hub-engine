@@ -16,11 +16,14 @@ from source import changes as changes_module
 
 
 def make_doc(_id, path, date, company_id="co1", doc_type="privacy_policy", fmt="txt"):
+    """`path` should be the extension-less base path stored on a document
+    (e.g. "co1/privacy_policy/1") -- create_changes_json appends ".txt"
+    itself when it needs the txt capture's file path."""
     return {
         "_id": _id,
         "company_id": company_id,
         "type": doc_type,
-        "format": fmt,
+        "formats": {fmt: {"extension": fmt, "original_url": "https://example.com"}},
         "path": path,
         "date_fetched": date,
     }
@@ -235,17 +238,17 @@ class TestCreateChangesJsonLocal:
         documents = [
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/1.txt",
+                "co1/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
             ),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/2.txt",
+                "co1/privacy_policy/2",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
             ),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/3.txt",
+                "co1/privacy_policy/3",
                 datetime(2024, 3, 1, tzinfo=timezone.utc),
             ),
         ]
@@ -277,11 +280,11 @@ class TestCreateChangesJsonLocal:
             "co1/privacy_policy/3.txt": "Later capture with different content",
         }
         documents = [
-            make_doc(ObjectId(), "co1/privacy_policy/1.txt", same_date),
-            make_doc(ObjectId(), "co1/privacy_policy/2.txt", same_date),
+            make_doc(ObjectId(), "co1/privacy_policy/1", same_date),
+            make_doc(ObjectId(), "co1/privacy_policy/2", same_date),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/3.txt",
+                "co1/privacy_policy/3",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
             ),
         ]
@@ -306,7 +309,7 @@ class TestCreateChangesJsonLocal:
         documents = [
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/1.txt",
+                "co1/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
             )
         ]
@@ -327,12 +330,12 @@ class TestCreateChangesJsonLocal:
         documents = [
             make_doc(
                 id1,
-                "co1/privacy_policy/1.txt",
+                "co1/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
             ),
             make_doc(
                 id2,
-                "co1/privacy_policy/2.txt",
+                "co1/privacy_policy/2",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
             ),
         ]
@@ -370,17 +373,17 @@ class TestCreateChangesJsonLocal:
         documents = [
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/1.txt",
+                "co1/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
             ),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/2.txt",
+                "co1/privacy_policy/2",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
             ),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/3.txt",
+                "co1/privacy_policy/3",
                 datetime(2024, 3, 1, tzinfo=timezone.utc),
             ),
         ]
@@ -406,25 +409,25 @@ class TestCreateChangesJsonLocal:
         documents = [
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/1.txt",
+                "co1/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
                 company_id="co1",
             ),
             make_doc(
                 ObjectId(),
-                "co1/privacy_policy/2.txt",
+                "co1/privacy_policy/2",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
                 company_id="co1",
             ),
             make_doc(
                 ObjectId(),
-                "co2/privacy_policy/1.txt",
+                "co2/privacy_policy/1",
                 datetime(2024, 1, 1, tzinfo=timezone.utc),
                 company_id="co2",
             ),
             make_doc(
                 ObjectId(),
-                "co2/privacy_policy/2.txt",
+                "co2/privacy_policy/2",
                 datetime(2024, 2, 1, tzinfo=timezone.utc),
                 company_id="co2",
             ),
@@ -470,16 +473,16 @@ class TestCreateChangesJsonMongo:
         id1, id2 = ObjectId(), ObjectId()
         grouped = [
             {
-                "_id": {"company_id": "co1", "type": "privacy_policy", "format": "txt"},
+                "_id": {"company_id": "co1", "type": "privacy_policy"},
                 "captures": [
                     {
                         "_id": id1,
-                        "path": "co1/privacy_policy/1.txt",
+                        "path": "co1/privacy_policy/1",
                         "date_fetched": datetime(2024, 1, 1, tzinfo=timezone.utc),
                     },
                     {
                         "_id": id2,
-                        "path": "co1/privacy_policy/2.txt",
+                        "path": "co1/privacy_policy/2",
                         "date_fetched": datetime(2024, 2, 1, tzinfo=timezone.utc),
                     },
                 ],
@@ -490,7 +493,7 @@ class TestCreateChangesJsonMongo:
         fake_client = FakeMongoClient(
             {
                 "dev_db": {
-                    "documents": documents_collection,
+                    "documents_v2": documents_collection,
                     "changes": changes_collection,
                 }
             }
@@ -525,16 +528,16 @@ class TestCreateChangesJsonMongo:
         id1, id2 = ObjectId(), ObjectId()
         grouped = [
             {
-                "_id": {"company_id": "co1", "type": "privacy_policy", "format": "txt"},
+                "_id": {"company_id": "co1", "type": "privacy_policy"},
                 "captures": [
                     {
                         "_id": id1,
-                        "path": "co1/privacy_policy/1.txt",
+                        "path": "co1/privacy_policy/1",
                         "date_fetched": datetime(2024, 1, 1, tzinfo=timezone.utc),
                     },
                     {
                         "_id": id2,
-                        "path": "co1/privacy_policy/2.txt",
+                        "path": "co1/privacy_policy/2",
                         "date_fetched": datetime(2024, 2, 1, tzinfo=timezone.utc),
                     },
                 ],
@@ -551,7 +554,7 @@ class TestCreateChangesJsonMongo:
         fake_client = FakeMongoClient(
             {
                 "dev_db": {
-                    "documents": documents_collection,
+                    "documents_v2": documents_collection,
                     "changes": changes_collection,
                 }
             }

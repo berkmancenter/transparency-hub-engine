@@ -102,6 +102,12 @@ temp/
 db/
 tmp/
 
+# Policy-classifier training data: large, reproducible via
+# scripts/build_policy_dataset.py, and contains third-party page
+# text -- doesn't belong in git history. The trained model artifact
+# (models/*.joblib) is small and intentionally NOT ignored here.
+scripts/data/
+
 # Powershell Scripts
 upload.ps1
 scheduler.ps1

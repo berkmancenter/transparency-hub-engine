@@ -67,7 +67,7 @@ class TestInit:
         CFG.USE_GCP = True
         CFG.DB_NAME = "dev_db"
         CFG.GCP_BUCKET = "my-bucket"
-        fake_mongo_client._databases["dev_db"] = {"documents": fake_collection}
+        fake_mongo_client._databases["dev_db"] = {"documents_v2": fake_collection}
         monkeypatch.setattr(pipeline_module, "mongo_connect", lambda: fake_mongo_client)
 
         class FakeGcsClient:
@@ -166,7 +166,7 @@ class TestProcessDocument:
         crawler = FakeCrawler(default=[crawl_result])
         pipeline = make_pipeline(crawler=crawler, collection=[])
         FakeProcessCrawl.return_value = (
-            [{"format": "txt", "company_id": "co1"}],
+            [{"formats": {"txt": {}}, "company_id": "co1"}],
             [Path("f.txt")],
         )
         monkeypatch.setattr(pipeline_module, "ProcessCrawl", FakeProcessCrawl)
@@ -212,7 +212,7 @@ class TestProcessDocument:
         }
         crawler = FakeCrawler(default=[crawl_result])
         pipeline = make_pipeline(crawler=crawler, collection=[])
-        mongo_data = [{"format": "txt", "company_id": "co1"}]
+        mongo_data = [{"formats": {"txt": {}}, "company_id": "co1"}]
         file_names = [Path("f.txt")]
         FakeProcessCrawl.return_value = (mongo_data, file_names)
         monkeypatch.setattr(pipeline_module, "ProcessCrawl", FakeProcessCrawl)
@@ -312,8 +312,8 @@ class TestProcessDocument:
         crawler = FakeCrawler(default=[crawl_result])
         pipeline = make_pipeline(crawler=crawler, collection=[])
         mongo_data = [
-            {"format": "txt", "company_id": "co1"},
-            {"format": "warc", "company_id": "co2"},
+            {"formats": {"txt": {}}, "company_id": "co1"},
+            {"formats": {"warc": {}}, "company_id": "co2"},
         ]
         FakeProcessCrawl.return_value = (mongo_data, [])
         monkeypatch.setattr(pipeline_module, "ProcessCrawl", FakeProcessCrawl)

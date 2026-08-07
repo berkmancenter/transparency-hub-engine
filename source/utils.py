@@ -237,7 +237,10 @@ def update_Mongo(results: list, collection):
         for result in results:
             try:
                 collection.insert_one(result)
-                logger.info(f"Successfully uploaded {result['path']} to MongoDB")
+                formats = list(result.get("formats", {}).keys())
+                logger.info(
+                    f"Successfully uploaded {result['path']} (formats: {formats}) to MongoDB"
+                )
             except Exception as e:
                 logger.error(f"Failed to upload document to MongoDB: {e}")
     except Exception as e:
@@ -367,6 +370,61 @@ def pull_db(dbPath: Path, createNew: bool = True) -> list[dict]:
         raise e
 
 
+def get_nested(doc: dict, dotted_key: str):
+    """
+    Resolves a dot-notation key (e.g. "formats.txt") against a nested dict,
+    mirroring how MongoDB resolves dotted field paths in queries.
+    """
+    value = doc
+    for part in dotted_key.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def matches_query(doc: dict, query: dict) -> bool:
+    """
+    Checks whether a single document matches a Pymongo-style query dict.
+    Supports dot-notation keys and the "$exists" operator, since that's all
+    this capture process currently needs from a hand-rolled query matcher.
+    """
+    for key, expected in query.items():
+        actual = get_nested(doc, key)
+        if isinstance(expected, dict) and "$exists" in expected:
+            if (actual is not None) != bool(expected["$exists"]):
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def local_find(
+    db: list[dict], query: dict, sort: list[tuple] | None = None
+) -> list[dict]:
+    """
+    Perform Pymongo find operation on a Python list[dict] in memory
+    This is only feature complete to the extent needed by this capture process
+
+    Args:
+      db (list[dict]): A python list representing the data collection
+      query (dict): A dictionary of key value pairs that must be matched by the returned items
+      sort (list[tuple]): Optional, defaults to None, sorts the matched items before returning
+
+    Returns:
+      list[dict]: Every item matching the query, sorted if requested
+    """
+    # Perform query matching
+    results = [dbItem for dbItem in db if matches_query(dbItem, query)]
+
+    # Apply all sort operations using consistent priority to pymongo find
+    if sort:
+        for key, direction in reversed(sort):
+            results.sort(key=lambda a: a[key], reverse=(direction == -1))
+
+    return results
+
+
 def local_find_one(
     db: list[dict], query: dict, sort: list[tuple] | None = None
 ) -> dict | None:
@@ -382,17 +440,7 @@ def local_find_one(
     Returns:
       dict | None: The first item after filtering with the query and sorting, or None if no items matched the query
     """
-    # Perform query matching
-    results = [
-        dbItem for dbItem in db if all(dbItem.get(a) == b for a, b in query.items())
-    ]
-
-    # Apply all sort operations using consistent priority to pymongo find_one
-    if sort:
-        for key, direction in reversed(sort):
-            results.sort(key=lambda a: a[key], reverse=(direction == -1))
-
-    # Return first result
+    results = local_find(db, query, sort=sort)
     return results[0] if results else None
 
 

@@ -408,6 +408,43 @@ class TestValidateFilesDispatch:
 
         assert ac.validate_file(path, "html") is True
 
+    def test_html_format_never_runs_policy_classifier(self, tmp_path, monkeypatch):
+        path = tmp_path / "doc.html"
+        path.write_bytes(b"<html><body>hi</body></html>")
+        monkeypatch.setattr(ac, "data_quality_check", lambda text: True)
+        called = {"value": False}
+        monkeypatch.setattr(
+            ac,
+            "passes_policy_document_check",
+            lambda text: called.update(value=True) or False,
+        )
+
+        assert ac.validate_file(path, "html") is True
+        assert called["value"] is False
+
+    def test_txt_format_fails_when_quality_check_fails(self, tmp_path, monkeypatch):
+        path = tmp_path / "doc.txt"
+        path.write_bytes(b"too short")
+        monkeypatch.setattr(ac, "data_quality_check", lambda text: False)
+        called = {"value": False}
+        monkeypatch.setattr(
+            ac,
+            "passes_policy_document_check",
+            lambda text: called.update(value=True) or True,
+        )
+
+        assert ac.validate_file(path, "txt") is False
+        # Classifier check should be skipped entirely once quality check fails
+        assert called["value"] is False
+
+    def test_txt_format_defers_to_policy_classifier_check(self, tmp_path, monkeypatch):
+        path = tmp_path / "doc.txt"
+        path.write_bytes(b"some perfectly fine looking text content")
+        monkeypatch.setattr(ac, "data_quality_check", lambda text: True)
+        monkeypatch.setattr(ac, "passes_policy_document_check", lambda text: False)
+
+        assert ac.validate_file(path, "txt") is False
+
     def test_timeout_returns_false(self, monkeypatch):
         def slow(local_path, format):
             import time as t
@@ -420,3 +457,155 @@ class TestValidateFilesDispatch:
         result = ac.validate_file(Path("x"), "txt", timeout=0.05)
 
         assert result is False
+
+
+# --------------------------------------------------------------------------
+# passes_policy_document_check
+# --------------------------------------------------------------------------
+
+
+class TestPassesPolicyDocumentCheck:
+    def test_true_when_classifier_disabled(self, monkeypatch):
+        monkeypatch.setattr(CFG, "USE_POLICY_CLASSIFIER", False)
+
+        assert ac.passes_policy_document_check("irrelevant text") is True
+
+    def test_defers_to_is_policy_document(self, monkeypatch):
+        monkeypatch.setattr(CFG, "USE_POLICY_CLASSIFIER", True)
+        monkeypatch.setattr(CFG, "POLICY_CLASSIFIER_THRESHOLD", 0.42)
+        calls = []
+
+        import source.policy_classifier as pc
+
+        def fake_is_policy_document(text, threshold=0.5, model_path=None):
+            calls.append((text, threshold))
+            return True
+
+        monkeypatch.setattr(pc, "is_policy_document", fake_is_policy_document)
+
+        assert ac.passes_policy_document_check("some policy text") is True
+        assert calls == [("some policy text", 0.42)]
+
+    def test_rejects_when_classifier_scores_below_threshold(self, monkeypatch):
+        monkeypatch.setattr(CFG, "USE_POLICY_CLASSIFIER", True)
+        import source.policy_classifier as pc
+
+        monkeypatch.setattr(pc, "is_policy_document", lambda *a, **k: False)
+
+        assert ac.passes_policy_document_check("cookie wall text") is False
+
+    def test_fails_open_when_classifier_raises(self, monkeypatch, caplog):
+        monkeypatch.setattr(CFG, "USE_POLICY_CLASSIFIER", True)
+        import source.policy_classifier as pc
+
+        def boom(*a, **k):
+            raise FileNotFoundError("no model on disk")
+
+        monkeypatch.setattr(pc, "is_policy_document", boom)
+
+        assert ac.passes_policy_document_check("some text") is True
+        assert "allowing capture through" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# reconstruct_text_from_format and its per-format helpers
+# --------------------------------------------------------------------------
+
+
+class TestReconstructTextFromFormat:
+    def test_html_delegates_to_read_text_from_html(self):
+        html = b"<html><body><p>Hello reconstructed world</p></body></html>"
+
+        text = ac.reconstruct_text_from_format(html, "html", "html")
+
+        assert "Hello reconstructed world" in text
+
+    def test_pdf_extracts_text_from_all_pages(self, monkeypatch):
+        class FakePage:
+            def __init__(self, text):
+                self._text = text
+
+            def extract_text(self):
+                return self._text
+
+        class FakeReader:
+            def __init__(self, source):
+                pass
+
+            @property
+            def pages(self):
+                return [FakePage("page one "), FakePage("page two")]
+
+        monkeypatch.setattr(ac.PyPDF2, "PdfReader", FakeReader)
+
+        text = ac.reconstruct_text_from_format(b"fake pdf bytes", "pdf", "pdf")
+
+        assert text == "page one page two"
+
+    def test_warc_json_prefers_record_matching_original_url(self):
+        raw = json.dumps(
+            {
+                "records": [
+                    {"urls": ["https://a.example/other"], "content": "other page"},
+                    {
+                        "urls": ["https://a.example/target"],
+                        "content": "target page content",
+                    },
+                ]
+            }
+        ).encode()
+
+        text = ac.reconstruct_text_from_format(
+            raw, "warc.json", "warc.json", originalUrl="https://a.example/target"
+        )
+
+        assert text == "target page content"
+
+    def test_warc_json_falls_back_to_joining_all_records(self):
+        raw = json.dumps(
+            {
+                "records": [
+                    {"urls": ["https://a.example/1"], "content": "first"},
+                    {"urls": ["https://a.example/2"], "content": "second"},
+                ]
+            }
+        ).encode()
+
+        text = ac.reconstruct_text_from_format(
+            raw, "warc.json", "warc.json", originalUrl="https://no-match.example"
+        )
+
+        assert text == "first\n\nsecond"
+
+    def test_warc_dispatches_to_read_wacz_file_with_wacz_mode_for_wacz_extension(
+        self, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(
+            ac,
+            "read_wacz_file",
+            lambda data, mode: calls.append((data, mode)) or "extracted",
+        )
+
+        result = ac.reconstruct_text_from_format(b"zip-bytes", "warc", "wacz")
+
+        assert result == "extracted"
+        assert calls == [(b"zip-bytes", "wacz")]
+
+    def test_warc_dispatches_warc_gz_mode_for_warc_gz_extension(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            ac,
+            "read_wacz_file",
+            lambda data, mode: calls.append((data, mode)) or "extracted",
+        )
+
+        ac.reconstruct_text_from_format(b"zip-bytes", "warc", "warc.gz")
+
+        assert calls == [(b"zip-bytes", "warc.gz")]
+
+    def test_unknown_format_returns_empty_string(self):
+        assert ac.reconstruct_text_from_format(b"bytes", "unknown", "ext") == ""
+
+    def test_reconstruction_format_priority_order(self):
+        assert ac.RECONSTRUCTION_FORMAT_PRIORITY == ["html", "pdf", "warc.json", "warc"]
