@@ -4,6 +4,7 @@
 
 # Imports
 import concurrent.futures
+import gc
 from typing import Dict
 import time
 
@@ -35,6 +36,7 @@ class DocumentPipeline:
         self.maxWorkers = CFG.MAX_WORKERS
 
         # Initialize clients and buckets to be reused by threads
+        self.mongoClient = None
         if CFG.USE_MONGO:
             logger.info("Connecting to MongoDB...")
             self.mongoClient = mongo_connect()
@@ -161,8 +163,22 @@ class DocumentPipeline:
                         with open(CFG.LOG_DIR / "recovery_log.txt", "a") as f:
                             # Write the url to the file
                             f.write(rUrl + "\n")
+                except MemoryError as e:
+                    # With the RLIMIT_AS safeguard in place (source.globals.apply_memory_safeguard),
+                    # this is expected to be what an oversized document looks like instead of the
+                    # whole container getting OOM-killed -- log it distinctly so it's easy to tell
+                    # apart from an actual bug, then let the other in-flight workers keep going
+                    logger.error(
+                        f"Batch {batch_idx + 1} hit the memory safeguard and was dropped: {e}"
+                    )
                 except Exception as e:
                     logger.error(f"Batch {batch_idx + 1} generated exception: {e}")
+                finally:
+                    # Encourage prompt release of this document's parsed DOM trees / PDF readers,
+                    # which can involve reference cycles that outlive normal refcounting until a
+                    # full GC pass -- worth the small fixed cost given multiple worker threads'
+                    # peaks can otherwise overlap
+                    gc.collect()
 
         if not CFG.IN_CLOUD and self.googleClient is not None:
             self.googleClient.close()

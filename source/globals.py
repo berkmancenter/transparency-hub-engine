@@ -52,7 +52,7 @@ class AppConfig:
     # Configuration Settings
     SYNC_PRIORITY: int = 1
     FUZZY_THRESHOLD: int = 97
-    MAX_WORKERS: int = 4
+    MAX_WORKERS: int = 2
     TIMEOUT: int = 1200
     CREATE_CHANGES: bool = True
     TOPIC_PATTERNS: dict = field(default_factory=dict)
@@ -60,9 +60,21 @@ class AppConfig:
     # Policy-document classifier (source/policy_classifier.py)
     USE_POLICY_CLASSIFIER: bool = True
     POLICY_CLASSIFIER_THRESHOLD: float = 0.3
+    # Header/footer boundary trimmer (source/boundary_classifier.py). Cosmetic
+    # only: trims boilerplate out of the diff written to .CHANGES.json for
+    # display in the Comparison Tool. Never affects whether a capture is
+    # saved or a change is detected -- see source/changes.py.
+    USE_DIFF_TRIMMER: bool = False
+    DIFF_TRIMMER_THRESHOLD: float = 0.85
     # Slack Notifications
     USE_SLACK: bool = False
     SLACK_WEBHOOK_URL: str = ""
+    # Runtime memory safeguard: self-imposed address-space cap, set below the
+    # container's actual memory limit so a single oversized document raises a
+    # catchable MemoryError instead of the OS OOM-killing the whole process.
+    # 0 disables the cap (default, and always disabled outside POSIX).
+    MEMORY_LIMIT_MB: int = 0
+    MEMORY_SOFT_LIMIT_RATIO: float = 0.85
     # Program environment management
     IN_LOCAL: bool = True
     IN_CLOUD: bool = False
@@ -80,6 +92,47 @@ def str_to_bool(value: str) -> bool:
     expected instead.
     """
     return value.lower() in ("true", "1", "yes", "t", "y")
+
+
+def apply_memory_safeguard():
+    """
+    Self-imposes a virtual address-space cap (RLIMIT_AS) below the
+    container's actual memory limit, when CFG.MEMORY_LIMIT_MB is configured.
+
+    Without this, a single oversized document (e.g. a large HTML DOM parse
+    or WACZ decompression during .txt reconstruction) can push the process
+    RSS up to the Cloud Run container's hard limit, at which point the Linux
+    OOM killer sends an uncatchable SIGKILL -- terminating every in-flight
+    worker and losing the run. With the cap in place, Python's own allocator
+    raises a normal MemoryError once the soft limit is crossed, which the
+    ThreadPoolExecutor's per-future exception handling can catch and log as
+    a single failed document instead of a killed container.
+
+    RLIMIT_AS is POSIX-only and is a no-op on Windows (local dev). It bounds
+    virtual address space rather than RSS directly, so it's a proxy for
+    actual memory use rather than an exact match -- fine here since nothing
+    in this pipeline reserves large address ranges without using them.
+    """
+    if CFG.MEMORY_LIMIT_MB <= 0:
+        return
+    try:
+        import resource  # type: ignore
+    except ImportError:
+        logger.info("Skipping memory safeguard: RLIMIT_AS is not available on this platform")
+        return
+
+    limit_bytes = int(CFG.MEMORY_LIMIT_MB * 1024 * 1024 * CFG.MEMORY_SOFT_LIMIT_RATIO)
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)  # type: ignore
+        if hard != resource.RLIM_INFINITY:  # type: ignore
+            limit_bytes = min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))  # type: ignore
+        logger.info(
+            f"Applied memory safeguard: RLIMIT_AS set to {limit_bytes / (1024 * 1024):.0f}MB "
+            f"({CFG.MEMORY_SOFT_LIMIT_RATIO:.0%} of configured {CFG.MEMORY_LIMIT_MB}MB container limit)"
+        )
+    except (ValueError, OSError) as e:
+        logger.warning(f"Failed to apply memory safeguard, continuing without it: {e}")
 
 
 def init_globals():
@@ -231,8 +284,12 @@ def init_globals():
         CFG.PRIORITY_DICT = config.get("PRIORITY_DICT", {})
         CFG.USE_POLICY_CLASSIFIER = config.get("USE_POLICY_CLASSIFIER", True)
         CFG.POLICY_CLASSIFIER_THRESHOLD = config.get("POLICY_CLASSIFIER_THRESHOLD", 0.3)
+        CFG.USE_DIFF_TRIMMER = config.get("USE_DIFF_TRIMMER", False)
+        CFG.DIFF_TRIMMER_THRESHOLD = config.get("DIFF_TRIMMER_THRESHOLD", 0.85)
         CFG.USE_SLACK = config.get("USE_SLACK", False)
         CFG.SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+        CFG.MEMORY_LIMIT_MB = config.get("MEMORY_LIMIT_MB", 0)
+        CFG.MEMORY_SOFT_LIMIT_RATIO = config.get("MEMORY_SOFT_LIMIT_RATIO", 0.85)
     except Exception as e:
         logger.error(f"Loading config failed, check {CONFIG_FILE}: {e}")
         sys.exit(1)
@@ -270,6 +327,8 @@ def init_globals():
     if not CFG.USE_MONGO:
         os.makedirs(CFG.DOCUMENTS_BSON.parent, exist_ok=True)
         os.makedirs(CFG.CHANGES_BSON.parent, exist_ok=True)
+
+    apply_memory_safeguard()
 
     if CFG.USE_GCP:
         if CFG.GCP_BUCKET == "my-bucket-1234":
@@ -311,6 +370,8 @@ def init_globals():
           CREATE_CHANGES = {CFG.CREATE_CHANGES}
           USE_POLICY_CLASSIFIER = {CFG.USE_POLICY_CLASSIFIER}
           {"POLICY_CLASSIFIER_THRESHOLD = " + str(CFG.POLICY_CLASSIFIER_THRESHOLD) if CFG.USE_POLICY_CLASSIFIER else "None"}
+          USE_DIFF_TRIMMER = {CFG.USE_DIFF_TRIMMER}
+          {"DIFF_TRIMMER_THRESHOLD = " + str(CFG.DIFF_TRIMMER_THRESHOLD) if CFG.USE_DIFF_TRIMMER else "None"}
           {"Topic Patterns are set in the config file" if CFG.TOPIC_PATTERNS != {} else "Topic Patterns are not set in the config file"}
           {"Priority Dictionary is set in the config file: " + str(CFG.PRIORITY_DICT) if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
           

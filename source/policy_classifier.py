@@ -17,6 +17,14 @@ from source.globals import logger
 
 DEFAULT_MODEL_PATH = Path("models/policy_classifier.joblib")
 
+# Caps the input handed to the sklearn pipeline's vectorizer, whose sparse-matrix
+# construction goes through scipy/Cython (C++) internals -- an allocation failure
+# there can surface as an uncaught C++ exception rather than Python's catchable
+# MemoryError. The model was trained on ordinary policy-document lengths, so this
+# is far above anything a real capture should produce and only guards against a
+# pathologically large (e.g. malformed or duplicated) reconstruction.
+MAX_CLASSIFIER_INPUT_CHARS = 50_000
+
 _model = None
 _model_path_loaded: Optional[Path] = None
 _model_lock = threading.Lock()
@@ -51,7 +59,7 @@ def policy_document_probability(text: str, model_path: Optional[Path] = None) ->
     document, as opposed to a bad or irrelevant capture.
     """
     model = load_model(model_path)
-    return float(model.predict_proba([text])[0][1])
+    return float(model.predict_proba([text[:MAX_CLASSIFIER_INPUT_CHARS]])[0][1])
 
 
 def is_policy_document(

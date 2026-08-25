@@ -6,6 +6,7 @@
 # These crawl results will then be parsed by process.py
 
 # Imports
+import concurrent.futures
 import time
 from typing import List, Dict
 import sys
@@ -21,17 +22,14 @@ class BrowsertrixCrawler:
 
     Args:
       dockerImage (str): The string name of the docker image of the custom browsertrix fork
-      maxWorkers (int): The maximum amount of workers to use during the capture process at one time
     """
 
     def __init__(
         self,
         dockerImage: str = "browsertrix-thub:1.2",
-        maxWorkers: int = CFG.MAX_WORKERS,
         mode: str = "document_capture",
     ):
         self.dockerImage = dockerImage
-        self.maxWorkers = maxWorkers
         self.mode = mode
 
     def create_crawl_command(self, url: str, crawlName: str) -> List[str]:
@@ -275,8 +273,11 @@ class BrowsertrixCrawler:
 
                 operation = client.run_job(request=request)
 
-                # Calling operation.result() will block until the crawl is complete
-                operation.result()
+                # Calling operation.result() blocks until the crawl job completes.
+                # Bounded by CFG.TIMEOUT to match the local (subprocess.run) and
+                # Docker (container.wait) branches above -- without a timeout, a
+                # stuck Cloud Run job execution would hang this call forever.
+                operation.result(timeout=CFG.TIMEOUT)
 
                 endTime = time.time()
                 duration = endTime - startTime
@@ -298,6 +299,17 @@ class BrowsertrixCrawler:
                         "duration": duration,
                     }
                     for pValue in pValues
+                ]
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Crawl '{crawlName}' timed out after {CFG.TIMEOUT}s")
+                return [
+                    {
+                        "crawl_name": crawlName,
+                        "success": False,
+                        "url": url,
+                        "pValues": pValues,
+                        "error": f"Timeout after {CFG.TIMEOUT}s",
+                    }
                 ]
             except Exception as e:
                 logger.error(

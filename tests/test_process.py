@@ -64,6 +64,7 @@ class TestInit:
         assert "original_url" not in proc.genItemInfo
         assert proc.failCounter == 0
         assert proc.confirmedNew is False
+        assert proc.txtDirectlyChanged is None
         assert proc.formats == {}
         assert proc.results == []
         assert proc.fileNames == []
@@ -743,6 +744,64 @@ class TestProcessCrawlOrchestration:
         newTxt = processor.sDir / f"{processor.cTimestamp}.txt"
         assert newTxt in file_names
         assert newTxt.read_text() == "Reconstructed from html"
+
+    def test_skips_remaining_formats_when_directly_captured_txt_is_unchanged(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        # A real .txt was captured (not reconstructed), but comparison finds no
+        # change -- html/pdf/warc.json/wacz would never be used for this document,
+        # so process_crawl should never even look for them.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.txt").write_text("hello")
+        (a_dir / "capture.html").write_text("<html></html>")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: False)
+
+        calls = []
+        real_process_format = processor.process_format
+
+        def tracking_process_format(format_obj):
+            calls.append(format_obj[0])
+            real_process_format(format_obj)
+
+        monkeypatch.setattr(processor, "process_format", tracking_process_format)
+
+        results, file_names = processor.process_crawl()
+
+        assert calls == ["txt"]
+        assert processor.txtDirectlyChanged is False
+        assert results == []
+        assert file_names == []
+
+    def test_does_not_skip_remaining_formats_when_txt_check_errors(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        # verify_content raising (e.g. a transient Mongo error) is an ambiguous
+        # outcome, not a confirmed non-change -- must not be treated the same as
+        # test_skips_remaining_formats_when_directly_captured_txt_is_unchanged.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.txt").write_text("hello")
+        (a_dir / "capture.html").write_text("<html></html>")
+
+        def flaky_verify_content(fmt, url, path):
+            if fmt == "txt":
+                raise RuntimeError("transient mongo error")
+            return True
+
+        monkeypatch.setattr(processor, "verify_content", flaky_verify_content)
+
+        calls = []
+        real_process_format = processor.process_format
+
+        def tracking_process_format(format_obj):
+            calls.append(format_obj[0])
+            real_process_format(format_obj)
+
+        monkeypatch.setattr(processor, "process_format", tracking_process_format)
+
+        processor.process_crawl()
+
+        assert processor.txtDirectlyChanged is None
+        assert "html" in calls
 
     def test_does_not_attempt_backfill_when_nothing_was_captured(
         self, processor, monkeypatch

@@ -63,7 +63,7 @@ class TestAppConfigDefaults:
         assert cfg.USE_GCP is True
         assert cfg.USE_SLACK is False
         assert cfg.FUZZY_THRESHOLD == 97
-        assert cfg.MAX_WORKERS == 4
+        assert cfg.MAX_WORKERS == 2
         assert cfg.TIMEOUT == 1200
         assert cfg.IN_LOCAL is True
         assert cfg.IN_CLOUD is False
@@ -73,6 +73,8 @@ class TestAppConfigDefaults:
         assert cfg.PRIORITY_DICT == {}
         assert cfg.USE_POLICY_CLASSIFIER is True
         assert cfg.POLICY_CLASSIFIER_THRESHOLD == 0.3
+        assert cfg.USE_DIFF_TRIMMER is False
+        assert cfg.DIFF_TRIMMER_THRESHOLD == 0.85
 
     def test_mutable_defaults_are_independent_per_instance(self):
         a, b = AppConfig(), AppConfig()
@@ -248,6 +250,8 @@ class TestConfigYamlLoading:
         assert CFG.USE_SLACK is False
         assert CFG.USE_POLICY_CLASSIFIER is True
         assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.3
+        assert CFG.USE_DIFF_TRIMMER is False
+        assert CFG.DIFF_TRIMMER_THRESHOLD == 0.85
         assert "Cookies" in CFG.TOPIC_PATTERNS
         pattern = CFG.TOPIC_PATTERNS["Cookies"][0]
         assert pattern.search("We use Cookies.") is not None
@@ -272,6 +276,8 @@ class TestConfigYamlLoading:
         assert CFG.USE_LOCAL_COMPANIES is False
         assert CFG.USE_POLICY_CLASSIFIER is True
         assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.3
+        assert CFG.USE_DIFF_TRIMMER is False
+        assert CFG.DIFF_TRIMMER_THRESHOLD == 0.85
 
     def test_policy_classifier_settings_loaded_from_config(self, monkeypatch, tmp_path):
         config_path = write_config(
@@ -287,6 +293,21 @@ class TestConfigYamlLoading:
 
         assert CFG.USE_POLICY_CLASSIFIER is False
         assert CFG.POLICY_CLASSIFIER_THRESHOLD == 0.5
+
+    def test_diff_trimmer_settings_loaded_from_config(self, monkeypatch, tmp_path):
+        config_path = write_config(
+            tmp_path,
+            overrides={
+                "USE_DIFF_TRIMMER": True,
+                "DIFF_TRIMMER_THRESHOLD": 0.7,
+            },
+        )
+        monkeypatch.setattr(sys, "argv", base_argv(tmp_path, config_path))
+
+        init_globals()
+
+        assert CFG.USE_DIFF_TRIMMER is True
+        assert CFG.DIFF_TRIMMER_THRESHOLD == 0.7
 
     def test_use_gcp_forced_false_in_cloud_mode(self, monkeypatch, tmp_path):
         monkeypatch.setenv("CLOUD_RUN_EXECUTION", "1")

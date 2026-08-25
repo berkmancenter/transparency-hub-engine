@@ -24,6 +24,15 @@ from source.globals import CFG, logger
 from source.utils import get_gcs_bytes, decode_bytes
 
 
+# Caps the input handed to rapidfuzz's C++ implementation. rapidfuzz raises a raw
+# C++ std::bad_alloc (not Python's catchable MemoryError) if an internal allocation
+# fails, which crashes the whole process via std::terminate -- no try/except here can
+# stop that. A malformed or duplicated reconstruction (see process.py
+# reconstruct_missing_txt) could otherwise hand it a pathologically large string; real
+# policy documents are far smaller than this cap, so truncating doesn't affect them.
+MAX_FUZZY_COMPARE_CHARS = 500_000
+
+
 def has_content_changed(
     oldText: str, newText: str, threshold: Optional[int] = None
 ) -> bool:
@@ -60,7 +69,10 @@ def has_content_changed(
     logger.debug(f"New text: {newText[:1000]}")
 
     # Perform fuzzy matching on text with a ratio of at least 97%
-    ratio = fuzz.ratio(text_normalize(oldText), text_normalize(newText))
+    ratio = fuzz.ratio(
+        text_normalize(oldText[:MAX_FUZZY_COMPARE_CHARS]),
+        text_normalize(newText[:MAX_FUZZY_COMPARE_CHARS]),
+    )
     return ratio < threshold
 
 
@@ -89,6 +101,27 @@ def read_text_from_html(htmlObj: bytes) -> str:
     return soup.get_text(separator=" ", strip=True)
 
 
+# Caps the total text accumulated while unzipping/decompressing a WACZ archive.
+# This is the last-resort format in RECONSTRUCTION_FORMAT_PRIORITY (raw WARC/WACZ is
+# the heaviest and messiest source), and unlike the other formats it has no inherent
+# size limit -- a page with a lot of captured network traffic (large data tables, many
+# embedded resources) can produce a WACZ whose fully decompressed, joined text is many
+# times larger than the page itself. That's cheap to allocate in Python but can trip an
+# uncaught C++ std::bad_alloc in a downstream native call (rapidfuzz, lxml) that isn't
+# translated into a catchable MemoryError, crashing the whole process. Stopping
+# accumulation once this cap is hit keeps the feature working for the WACZ sizes actually
+# produced by a single crawled page, while bounding the pathological case.
+MAX_WACZ_EXTRACT_CHARS = 2_000_000
+
+# Guards against a single pathologically large entry within the WACZ (e.g. a page whose
+# WARC response body is much bigger than typical page text) blowing past
+# MAX_WACZ_EXTRACT_CHARS in one shot -- the cumulative cap above only stops *further*
+# entries once crossed, so a single oversized one needs its own check before it's read
+# and decompressed at all. zipfile's central-directory metadata reports each entry's
+# uncompressed size without having to read/decompress it first.
+MAX_WACZ_ENTRY_BYTES = 20_000_000
+
+
 def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
     """
     A wrapper for extracting text from a WARC file bundle
@@ -111,6 +144,7 @@ def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
           list: A list of all the extracted text
         """
         allText = []
+        totalChars = 0
 
         fileList = wacz.namelist()
         warcFiles = [
@@ -122,6 +156,18 @@ def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
         htmlFiles = [file for file in fileList if file.endswith(".html")]
 
         for warcFile in warcFiles:
+            if totalChars >= MAX_WACZ_EXTRACT_CHARS:
+                logger.warning(
+                    f"WACZ text extraction hit the {MAX_WACZ_EXTRACT_CHARS}-char cap, "
+                    f"skipping remaining WARC entries"
+                )
+                break
+            if wacz.getinfo(warcFile).file_size > MAX_WACZ_ENTRY_BYTES:
+                logger.warning(
+                    f"Skipping oversized WARC entry {warcFile} "
+                    f"({wacz.getinfo(warcFile).file_size} bytes)"
+                )
+                continue
             try:
                 content = wacz.read(warcFile)
                 if warcFile.endswith(".warc.gz"):
@@ -130,16 +176,30 @@ def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
                 text = decode_bytes(content)
                 if text:
                     allText.append(text)
+                    totalChars += len(text)
             except Exception as e:
                 logger.error(f"Error reading WARC file: {e}")
                 continue
 
         for htmlFile in htmlFiles:
+            if totalChars >= MAX_WACZ_EXTRACT_CHARS:
+                logger.warning(
+                    f"WACZ text extraction hit the {MAX_WACZ_EXTRACT_CHARS}-char cap, "
+                    f"skipping remaining HTML entries"
+                )
+                break
+            if wacz.getinfo(htmlFile).file_size > MAX_WACZ_ENTRY_BYTES:
+                logger.warning(
+                    f"Skipping oversized HTML entry {htmlFile} "
+                    f"({wacz.getinfo(htmlFile).file_size} bytes)"
+                )
+                continue
             try:
                 content = wacz.read(htmlFile)
                 text = read_text_from_html(content)
                 if text:
                     allText.append(text)
+                    totalChars += len(text)
             except Exception as e:
                 logger.error(f"Error reading HTML file: {e}")
                 continue
@@ -162,38 +222,6 @@ def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
     except Exception as e:
         logger.error(f"Error reading WARC file: {e}")
         return ""
-
-
-def compare_warc_files(gcsBytes: bytes, localPath: Path, gcpPath: str) -> bool:
-    """
-    Compares two WARC files and returns True if they have changed, False otherwise
-
-    Args:
-        gcsBytes: The bytes of the GCS file to compare
-        localPath: The local path of the WARC file to compare
-        gcpPath: The GCP path of the WARC file to compare
-
-    Returns:
-        bool: True if the file has changed, False otherwise
-    """
-    # Compare WARC files - support both wacz and warc.gz
-    with open(localPath, "rb") as f:
-        localBytes = f.read()
-
-    if str(localPath).endswith(".warc.gz"):
-        localMode = "warc.gz"
-    else:
-        localMode = "wacz"
-
-    localText = read_wacz_file(localBytes, localMode)
-    if str(gcpPath).endswith(".warc.gz"):
-        gcpMode = "warc.gz"
-    else:
-        gcpMode = "wacz"
-    gcsText = read_wacz_file(gcsBytes, gcpMode)
-
-    # Perform fuzzy matching on text with a ratio of at least 97%
-    return has_content_changed(localText, gcsText)
 
 
 def compare_html_files(gcsBytes: bytes, localPath: Path) -> bool:

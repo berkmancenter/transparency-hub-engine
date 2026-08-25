@@ -68,6 +68,11 @@ class ProcessCrawl:
         self.formats = {}
         self.results = []
         self.fileNames = []
+        # None until a directly-captured (not reconstructed) .txt is actually compared;
+        # set to False only when that comparison ran cleanly and found no change, so
+        # process_crawl can short-circuit. Left at None on a missing/errored .txt so an
+        # ambiguous outcome never gets treated as a confirmed non-change.
+        self.txtDirectlyChanged = None
 
     def process_crawl(self):
         """
@@ -84,23 +89,36 @@ class ProcessCrawl:
             ("html", self.aDir),
             ("pdf", self.aDir),
         ]
-        for formatObj in formatDir:
-            # Do the actual processing dependent on the formatObj
-            self.process_format(formatObj)
 
-        # Process the wacz file last.  If all other formats failed, skip it
-        # Note that this would include a failure of the warc.json, which can serve as a point of truth for even the archive
-        # The wacz should always be saved if another format changed
-        if self.failCounter < len(formatDir):
-            self.process_format(("wacz", self.cDir))
+        # Check the directly-captured .txt first, since it's the format we actually
+        # compare documents by. If it was captured and cleanly confirmed unchanged,
+        # none of the other formats would end up being used for this document either
+        # -- skip finding/comparing/copying them entirely instead of doing that work
+        # just to throw it away.
+        self.process_format(formatDir[0])
+
+        if self.txtDirectlyChanged is False:
+            logger.info(
+                f"No change in directly-captured .txt for {self.crawlResult['url']}, "
+                "skipping remaining formats"
+            )
         else:
-            logger.info("All other formats failed, skipping wacz file")
+            for formatObj in formatDir[1:]:
+                self.process_format(formatObj)
 
-        # The crawl didn't produce a .txt directly -- try to backfill one from
-        # whatever other format was captured, so a .txt is available for
-        # nearly every archived document
-        if self.formats and "txt" not in self.formats:
-            self.reconstruct_missing_txt()
+            # Process the wacz file last.  If all other formats failed, skip it
+            # Note that this would include a failure of the warc.json, which can serve as a point of truth for even the archive
+            # The wacz should always be saved if another format changed
+            if self.failCounter < len(formatDir):
+                self.process_format(("wacz", self.cDir))
+            else:
+                logger.info("All other formats failed, skipping wacz file")
+
+            # The crawl didn't produce a .txt directly -- try to backfill one from
+            # whatever other format was captured, so a .txt is available for
+            # nearly every archived document
+            if self.formats and "txt" not in self.formats:
+                self.reconstruct_missing_txt()
 
         # All processing is complete, merge any captured formats into a single document
         if self.formats:
@@ -168,6 +186,8 @@ class ProcessCrawl:
             else:
                 logger.info(f"No new {iFormat} file for {originalUrl}")
                 self.failCounter += 1
+                if iFormat == "txt":
+                    self.txtDirectlyChanged = False
         except Exception as e:
             # Continue to try to find other formats
             logger.error(

@@ -1,0 +1,30 @@
+{
+  "_meta": {
+    "description": "Hand-verified boundary validation set for source/boundary_classifier.py. Each entry's start/end were determined by reading the actual block text of a real capture and judging where the genuine policy-document body begins and ends -- independent of the DOM-landmark/repetition/itemized-heading heuristics used to weak-label the training set. Never used for training, only for evaluating the trained model's real-world precision.",
+    "sample_seed": 2026,
+    "n_documents": 21
+  },
+  "documents": [
+    {"path": "6840b087a96cab74c26a324c/privacy_policy/1544001738.0.html", "n": 9, "start": 0, "end": 9, "note": "entire capture is body text, no chrome at all"},
+    {"path": "675211559efd527760c64416/terms_of_service/1680488051.0.html", "n": 217, "start": 11, "end": 179, "note": "LinkedIn ToS; leading breadcrumb nav repeated twice, trailing footer + 26-language switcher"},
+    {"path": "69c2a6e8662b0a1ec8b66ae2/ai_transparency_statement/1777402120.html", "n": 151, "start": 94, "end": 102, "note": "Garmin; real statement is only 8 of 151 blocks, buried in e-commerce mega-menu + footer"},
+    {"path": "6840b087a96cab74c26a323c/privacy_policy/1632457316.0.html", "n": 29, "start": 0, "end": 29, "note": "entire capture is body text, no chrome at all"},
+    {"path": "675211559efd527760c64417/privacy_policy/1711933534.0.html", "n": 184, "start": 38, "end": 159, "note": "Snapchat; leading privacy-hub nav repeated twice, trailing footer + country list"},
+    {"path": "6840b084a96cab74c26a3214/terms_of_service/1780704048.html", "n": 740, "start": 584, "end": 700, "note": "Publer; extreme case, 584-block cookie-consent banner/table precedes the real ToS (only 15.7% of blocks are body)"},
+    {"path": "6840b082a96cab74c26a31c3/community_guidelines/1761671842.html", "n": 64, "start": 0, "end": 64, "note": "entire capture is body text, no chrome at all"},
+    {"path": "69e0ff526e732293bfd0203f/cookie_policy/1663256995.html", "n": 265, "start": 24, "end": 238, "note": "Flo; leading cookie-consent banner + nav, trailing footer/content links/language list"},
+    {"path": "68544a3953c40294de27364b/privacy_policy/1772136168.html", "n": 176, "start": 43, "end": 161, "note": "Clockout; leading nav repeated ~7 times, trailing tagline+quick links footer"},
+    {"path": "675c92984b443c7c16d5b210/terms_of_service/1378799645.0.html", "n": 79, "start": 0, "end": 79, "note": "Hinge (2013 capture); entire capture is body text, no chrome at all"},
+    {"path": "675211559efd527760c6441a/community_guidelines/1741127979.525149.html", "n": 581, "start": 528, "end": 560, "note": "Reddit; extreme case, 527 blocks of multilingual policy-hub/revision-history chrome precede the real Rules text (only 5.5% of blocks are body)"},
+    {"path": "6840b087a96cab74c26a32aa/community_guidelines/1779494438.html", "n": 159, "start": 17, "end": 30, "note": "Letterboxd; short real policy (13 blocks) between login-nav and a footer that includes leaked date-picker widget markup"},
+    {"path": "675c92984b443c7c16d5b20e/community_guidelines/1633188620.0.html", "n": 165, "start": 59, "end": 106, "note": "Tinder (via a partner-brand capture); leading full language switcher + footer-style nav, trailing language switcher repeat + footer"},
+    {"path": "6840b082a96cab74c26a31d2/privacy_policy/1569922099.0.html", "n": 247, "start": 44, "end": 208, "note": "EliteSingles; leading blog/article-teaser nav (unrelated marketing content), trailing signup widget + footer"},
+    {"path": "6840b084a96cab74c26a31ec/terms_of_service/1570597382.0.html", "n": 282, "start": 0, "end": 282, "note": "7TextMe EULA; entire capture is body text, no chrome at all (no footer captured)"},
+    {"path": "6840b082a96cab74c26a31c0/cookie_policy/1772136168.html", "n": 66, "start": 3, "end": 25, "note": "Muzz; short nav, trailing marketing content + footer + donation widget"},
+    {"path": "675b40af4b443c7c16d5b1f0/community_guidelines/1745857714.962457.html", "n": 91, "start": 25, "end": 72, "note": "Parler; leading app-nav, trailing marketing content + address/copyright footer"},
+    {"path": "6840b087a96cab74c26a32aa/community_guidelines/1777384263.html", "n": 159, "start": 17, "end": 30, "note": "Letterboxd, different timestamp than the other entry -- same site structure, same boundary"},
+    {"path": "6840b082a96cab74c26a31d6/terms_of_service/1696949433.0.html", "n": 151, "start": 14, "end": 151, "note": "Crushon.ai; leading nav only, no trailing footer captured"},
+    {"path": "6840b082a96cab74c26a31d6/privacy_policy/1761671842.html", "n": 166, "start": 24, "end": 166, "note": "Crushon.ai; leading nav only, no trailing footer captured"},
+    {"path": "6840b087a96cab74c26a32ab/privacy_policy/1517851350.0.html", "n": 104, "start": 21, "end": 77, "note": "Zangi; leading nav, trailing app-download CTA + footer nav repeat"}
+  ]
+}

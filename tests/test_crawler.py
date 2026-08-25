@@ -26,14 +26,10 @@ class TestConstructor:
         crawler = BrowsertrixCrawler()
         assert crawler.dockerImage == "browsertrix-thub:1.2"
         assert crawler.mode == "document_capture"
-        assert crawler.maxWorkers == CFG.MAX_WORKERS
 
     def test_custom_values(self):
-        crawler = BrowsertrixCrawler(
-            dockerImage="custom:1.0", maxWorkers=2, mode="other"
-        )
+        crawler = BrowsertrixCrawler(dockerImage="custom:1.0", mode="other")
         assert crawler.dockerImage == "custom:1.0"
-        assert crawler.maxWorkers == 2
         assert crawler.mode == "other"
 
 
@@ -302,7 +298,8 @@ class TestRunSingleCrawlCloud:
         captured = {}
 
         class FakeOperation:
-            def result(self):
+            def result(self, timeout=None):
+                captured["timeout"] = timeout
                 return None
 
         class FakeJobsClient:
@@ -317,6 +314,38 @@ class TestRunSingleCrawlCloud:
 
         assert results[0]["success"] is True
         assert captured["request"].name == "projects/proj/locations/us-east4/jobs/job"
+        assert captured["timeout"] == CFG.TIMEOUT
+
+    def test_job_execution_timeout(self, monkeypatch, tmp_path, p_data):
+        # operation.result() is bounded by CFG.TIMEOUT so a stuck Cloud Run job
+        # execution can't hang this call forever the way it used to.
+        import concurrent.futures
+
+        CFG.IN_LOCAL = False
+        CFG.IN_DOCKER = False
+        CFG.IN_CLOUD = True
+        CFG.CRAWL_DIR = tmp_path
+        CFG.GCLOUD_PROJECT = "proj"
+        CFG.GCLOUD_REGION = "us-east4"
+        CFG.GCLOUD_JOB = "job"
+
+        from google.cloud import run_v2
+
+        class FakeOperation:
+            def result(self, timeout=None):
+                raise concurrent.futures.TimeoutError()
+
+        class FakeJobsClient:
+            def run_job(self, request):
+                return FakeOperation()
+
+        monkeypatch.setattr(run_v2, "JobsClient", lambda: FakeJobsClient())
+        crawler = BrowsertrixCrawler()
+
+        results = crawler.run_single_crawl(p_data, "crawl1")
+
+        assert results[0]["success"] is False
+        assert str(CFG.TIMEOUT) in results[0]["error"]
 
     def test_generic_exception(self, monkeypatch, tmp_path, p_data):
         CFG.IN_LOCAL = False

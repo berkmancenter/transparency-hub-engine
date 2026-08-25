@@ -3,6 +3,7 @@
 # This file is designed to run within the sync, but can also be ran as a standalone script
 
 # Imports
+import gc
 import json
 import re
 import os
@@ -16,12 +17,117 @@ from source.utils import (
     decode_bytes,
     DocumentCache,
     pull_db,
-    local_find_one,
+    local_find,
     save_db,
 )
 
 if CFG.USE_MONGO:
     from pymongo.collection import Collection
+
+
+def _fetch_and_decode_with_retries(
+    path: str, bucket, doc_cache: DocumentCache, retries: int = 2
+) -> str | None:
+    """
+    Fetches and decodes a document's text via get_gcs_bytes, retrying on timeout.
+    Returns None (after logging) if it still fails after all retries, so the caller
+    can skip this pair instead of letting one stuck read crash the entire run.
+    """
+    for attempt in range(1, retries + 2):
+        try:
+            text = decode_bytes(get_gcs_bytes(path, bucket))
+            doc_cache.put(path, text)
+            return text
+        except TimeoutError as e:
+            logger.error(f"Attempt {attempt} failed fetching {path}: {e}")
+    logger.error(f"Giving up on {path} after {retries + 1} attempts, skipping this pair")
+    return None
+
+
+def _fetch_html_trimmed(
+    capture: dict, bucket, html_cache: DocumentCache
+) -> str | None:
+    """
+    Fetches a capture's html format (if it has one) and trims header/footer/
+    nav boilerplate off it via source/boundary_classifier.py, purely so the
+    diff written to .CHANGES.json reads cleaner in the Comparison Tool.
+
+    This is cosmetic only -- it's never used for change-detection, and a
+    None return (no html format, fetch failure, or classifier failure) just
+    tells the caller to fall back to the full untrimmed .txt, exactly as
+    before this existed.
+    """
+    formats = capture.get("formats") or {}
+    if "html" not in formats:
+        return None
+
+    try:
+        # Extension lookup included in the try/except -- malformed or legacy
+        # formats.html metadata (e.g. missing "extension") must fail open to
+        # the untrimmed .txt like any other failure here, not crash the run.
+        extension = formats["html"]["extension"]
+        path = f"{capture['path']}.{extension}"
+
+        cached = html_cache.get(path)
+        if cached is not None:
+            return cached
+
+        from source.boundary_classifier import extract_policy_text
+
+        html_bytes = get_gcs_bytes(path, bucket)
+        trimmed = extract_policy_text(html_bytes, threshold=CFG.DIFF_TRIMMER_THRESHOLD)
+        if not trimmed:
+            # No blocks extracted at all -- an empty diff would be more
+            # confusing than useful, so treat this the same as a failure
+            # and let the caller fall back to the untrimmed .txt.
+            return None
+        html_cache.put(path, trimmed)
+        return trimmed
+    except Exception as e:
+        logger.warning(f"Diff trimmer failed for {capture['path']}, using untrimmed text instead: {e}")
+        return None
+
+
+def get_diff_text(
+    olderCapture: dict,
+    newerCapture: dict,
+    bucket,
+    doc_cache: DocumentCache,
+    html_cache: DocumentCache,
+) -> tuple[str | None, str | None]:
+    """
+    Returns the (older, newer) text to build a .CHANGES.json diff from.
+
+    When CFG.USE_DIFF_TRIMMER is on and both captures have an html format,
+    both sides are trimmed via the same extraction pipeline (never just
+    one side, which would show a diff full of extraction-style noise rather
+    than real content changes). Otherwise -- or if either side's html fetch
+    or trim fails -- both sides fall back to the full, untrimmed .txt.
+    """
+    if CFG.USE_DIFF_TRIMMER:
+        olderTrimmed = _fetch_html_trimmed(olderCapture, bucket, html_cache)
+        newerTrimmed = _fetch_html_trimmed(newerCapture, bucket, html_cache)
+        if olderTrimmed is not None and newerTrimmed is not None:
+            return olderTrimmed, newerTrimmed
+
+    olderPath = f"{olderCapture['path']}.txt"
+    newerPath = f"{newerCapture['path']}.txt"
+
+    olderText = doc_cache.get(olderPath)
+    if olderText is None:
+        logger.info(f"Cache miss - fetching {olderPath}")
+        olderText = _fetch_and_decode_with_retries(olderPath, bucket, doc_cache)
+    else:
+        logger.info(f"Cache hit - {olderPath}")
+
+    newerText = doc_cache.get(newerPath)
+    if newerText is None:
+        logger.info(f"Cache miss - fetching {newerPath}")
+        newerText = _fetch_and_decode_with_retries(newerPath, bucket, doc_cache)
+    else:
+        logger.info(f"Cache hit - {newerPath}")
+
+    return olderText, newerText
 
 
 def tokenize(text: str) -> list:
@@ -434,6 +540,7 @@ def create_changes_json(idSet: set | None = None):
                             "_id": "$_id",
                             "path": "$path",
                             "date_fetched": "$date_fetched",
+                            "formats": "$formats",
                         }
                     },
                 }
@@ -467,6 +574,7 @@ def create_changes_json(idSet: set | None = None):
                         "_id": doc["_id"],
                         "path": doc.get("path"),
                         "date_fetched": doc["date_fetched"],
+                        "formats": doc.get("formats", {}),
                     }
                 )
 
@@ -487,9 +595,6 @@ def create_changes_json(idSet: set | None = None):
 
         googleClient = Client()
         bucket = googleClient.get_bucket(CFG.GCP_BUCKET)
-
-    max_captures = max((len(g["captures"]) for g in grouped_captures), default=10)
-    doc_cache = DocumentCache(capacity=max_captures)
 
     # Process one company and docType at a time
     for group in grouped_captures:
@@ -540,23 +645,50 @@ def create_changes_json(idSet: set | None = None):
             )
             continue
 
+        # Cache decoded document text within this group only, sized to this
+        # group's own capture count. Any of these captures may be revisited
+        # across the O(n^2) pairwise comparisons below, so caching all of
+        # them avoids re-fetching/re-decoding the same text repeatedly -- but
+        # the cache is rebuilt fresh per group (rather than shared globally
+        # sized to the largest group in the whole run) so a company with a
+        # long capture history doesn't keep its decoded text resident in
+        # memory while later, unrelated groups are being processed.
+        doc_cache = DocumentCache(capacity=len(validCaptures))
+        # Separate cache for boundary-trimmed html text (see get_diff_text) --
+        # kept apart from doc_cache since it stores a different derived value
+        # (trimmed html-sourced text, not the raw .txt) under a different key
+        # (the html path, not the txt path) for the same underlying capture.
+        html_cache = DocumentCache(capacity=len(validCaptures))
+
+        # Fetch every existing (older_id, newer_id) pair for this company/type
+        # ONCE, rather than one find_one() per pair below -- the O(n^2) pairwise
+        # loop was previously making that many individual round trips (e.g. 325
+        # for a company with 26 captures), almost all of which just confirm a
+        # change created in a prior run. A single query plus in-memory set
+        # membership checks preserves identical behavior for a fraction of the
+        # DB load.
+        existingPairsQuery = {"company_id": companyId, "type": docType}
+        if CFG.USE_MONGO:
+            existingPairs = {
+                (doc["older_document_id"], doc["newer_document_id"])
+                for doc in mongoChangesDB.find(existingPairsQuery)
+            }
+        else:
+            existingPairs = {
+                (doc["older_document_id"], doc["newer_document_id"])
+                for doc in local_find(localChangesDB, existingPairsQuery)
+            }
+
         # Iterate through the documents in time order
         for i in range(len(validCaptures)):
             for j in range(i + 1, len(validCaptures)):
                 olderCapture = validCaptures[i]
                 newerCapture = validCaptures[j]
 
-                # See if this Change document already exists
-                query = {
-                    "company_id": companyId,
-                    "type": docType,
-                    "older_document_id": olderCapture["_id"],
-                    "newer_document_id": newerCapture["_id"],
-                }
-                if CFG.USE_MONGO:
-                    changeExists = mongoChangesDB.find_one(query)
-                else:
-                    changeExists = local_find_one(localChangesDB, query)
+                changeExists = (
+                    olderCapture["_id"],
+                    newerCapture["_id"],
+                ) in existingPairs
 
                 if changeExists:
                     # This change does exist, we don't need to rebuild it
@@ -564,28 +696,21 @@ def create_changes_json(idSet: set | None = None):
                         f"Change already exists for company_id: {companyId}, type: {docType}, older_capture: {olderCapture['_id']}, newer_capture: {newerCapture['_id']}..."
                     )
                 else:
-                    # This is a new change that needs to be created
-                    # Pull the data from the GCP bucket
-                    # The txt extension is always "txt" regardless of any historical drift in other formats
+                    # This is a new change that needs to be created.
+                    # The txt extension is always "txt" regardless of any historical drift in other formats.
+                    # This is the canonical stored-capture path recorded in the change record below,
+                    # independent of whichever text get_diff_text actually used to build the diff itself.
                     olderPath = f"{olderCapture['path']}.txt"
                     newerPath = f"{newerCapture['path']}.txt"
 
-                    # Check cache before fetching from GCS
-                    olderText = doc_cache.get(olderPath)
-                    if olderText is None:
-                        logger.info(f"Cache miss — fetching {olderPath}")
-                        olderText = decode_bytes(get_gcs_bytes(olderPath, bucket))
-                        doc_cache.put(olderPath, olderText)
-                    else:
-                        logger.info(f"Cache hit — {olderPath}")
-
-                    newerText = doc_cache.get(newerPath)
-                    if newerText is None:
-                        logger.info(f"Cache miss — fetching {newerPath}")
-                        newerText = decode_bytes(get_gcs_bytes(newerPath, bucket))
-                        doc_cache.put(newerPath, newerText)
-                    else:
-                        logger.info(f"Cache hit — {newerPath}")
+                    # Pull the display text -- boundary-trimmed html when
+                    # CFG.USE_DIFF_TRIMMER allows it, otherwise the full
+                    # untrimmed .txt -- from the GCP bucket.
+                    olderText, newerText = get_diff_text(
+                        olderCapture, newerCapture, bucket, doc_cache, html_cache
+                    )
+                    if olderText is None or newerText is None:
+                        continue
 
                     # Create the diff data from the retrieved text content
                     diffData = create_patience_diff_data(olderText, newerText)
@@ -665,6 +790,12 @@ def create_changes_json(idSet: set | None = None):
                     else:
                         save_db([change_document], CFG.CHANGES_BSON)
                         logger.info("  Changes detected: Inserted to local database")
+
+        # This group's doc_cache (and any diff data still referenced from the
+        # inner loops above) goes out of scope here; force a collection pass
+        # before moving to the next company/type group so a long capture
+        # history doesn't linger in memory while unrelated groups are processed
+        gc.collect()
 
 
 if __name__ == "__main__":

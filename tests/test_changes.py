@@ -2,6 +2,7 @@
 # create_changes_json() pipeline that turns pairs of stored captures into
 # .CHANGES.json documents for the Transparency Hub's comparison tool.
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -206,6 +207,174 @@ class TestAnalyzeTopicChanges:
 
 
 # --------------------------------------------------------------------------
+# _fetch_html_trimmed / get_diff_text
+# --------------------------------------------------------------------------
+
+
+class TestFetchHtmlTrimmed:
+    def test_returns_none_when_capture_has_no_html_format(self):
+        cache = changes_module.DocumentCache(capacity=2)
+        capture = {"path": "co1/privacy_policy/1", "formats": {"txt": {"extension": "txt"}}}
+
+        assert changes_module._fetch_html_trimmed(capture, None, cache) is None
+
+    def test_fetches_and_trims_html_then_caches_it(self, monkeypatch):
+        cache = changes_module.DocumentCache(capacity=2)
+        capture = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        fetch_calls = []
+        monkeypatch.setattr(
+            changes_module,
+            "get_gcs_bytes",
+            lambda path, bucket: (fetch_calls.append(path), b"<p>raw html</p>")[1],
+        )
+        import source.boundary_classifier as bc
+
+        monkeypatch.setattr(
+            bc, "extract_policy_text", lambda html, threshold=None, model_path=None: "trimmed text"
+        )
+
+        result = changes_module._fetch_html_trimmed(capture, None, cache)
+
+        assert result == "trimmed text"
+        assert fetch_calls == ["co1/privacy_policy/1.html"]
+        # Second call should hit the cache, not fetch again.
+        changes_module._fetch_html_trimmed(capture, None, cache)
+        assert fetch_calls == ["co1/privacy_policy/1.html"]
+
+    def test_returns_none_and_logs_when_fetch_fails(self, monkeypatch, caplog):
+        cache = changes_module.DocumentCache(capacity=2)
+        capture = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        monkeypatch.setattr(
+            changes_module,
+            "get_gcs_bytes",
+            lambda path, bucket: (_ for _ in ()).throw(TimeoutError("slow")),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = changes_module._fetch_html_trimmed(capture, None, cache)
+
+        assert result is None
+        assert "using untrimmed text instead" in caplog.text
+
+    def test_returns_none_instead_of_crashing_on_malformed_html_format_metadata(
+        self, monkeypatch, caplog
+    ):
+        # Regression: a formats.html entry missing "extension" (legacy/
+        # malformed data) must fail open like any other failure here, not
+        # raise KeyError out of the function and crash the whole run.
+        cache = changes_module.DocumentCache(capacity=2)
+        capture = {"path": "co1/privacy_policy/1", "formats": {"html": {}}}
+
+        with caplog.at_level(logging.WARNING):
+            result = changes_module._fetch_html_trimmed(capture, None, cache)
+
+        assert result is None
+        assert "using untrimmed text instead" in caplog.text
+
+    def test_returns_none_when_extraction_yields_no_text(self, monkeypatch):
+        # Regression: extract_policy_text can legitimately return "" (no
+        # blocks found at all). An empty string is not None, so treating it
+        # as a successful trim would produce a nonsensical empty diff
+        # instead of falling back to the real .txt text.
+        cache = changes_module.DocumentCache(capacity=2)
+        capture = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        monkeypatch.setattr(changes_module, "get_gcs_bytes", lambda path, bucket: b"<html></html>")
+        import source.boundary_classifier as bc
+
+        monkeypatch.setattr(
+            bc, "extract_policy_text", lambda html, threshold=None, model_path=None: ""
+        )
+
+        result = changes_module._fetch_html_trimmed(capture, None, cache)
+
+        assert result is None
+        assert cache.get("co1/privacy_policy/1.html") is None
+
+
+class TestGetDiffText:
+    def _caches(self):
+        return changes_module.DocumentCache(capacity=4), changes_module.DocumentCache(capacity=4)
+
+    def test_uses_trimmed_html_when_enabled_and_both_sides_have_it(self, monkeypatch):
+        CFG.USE_DIFF_TRIMMER = True
+        older = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        newer = {"path": "co1/privacy_policy/2", "formats": {"html": {"extension": "html"}}}
+        monkeypatch.setattr(
+            changes_module,
+            "_fetch_html_trimmed",
+            lambda capture, bucket, cache: f"trimmed-{capture['path']}",
+        )
+        doc_cache, html_cache = self._caches()
+
+        older_text, newer_text = changes_module.get_diff_text(
+            older, newer, None, doc_cache, html_cache
+        )
+
+        assert (older_text, newer_text) == ("trimmed-co1/privacy_policy/1", "trimmed-co1/privacy_policy/2")
+
+    def test_falls_back_to_txt_when_trimmer_disabled(self, monkeypatch):
+        CFG.USE_DIFF_TRIMMER = False
+        older = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        newer = {"path": "co1/privacy_policy/2", "formats": {"html": {"extension": "html"}}}
+        texts = {
+            "co1/privacy_policy/1.txt": "older raw text",
+            "co1/privacy_policy/2.txt": "newer raw text",
+        }
+        monkeypatch.setattr(
+            changes_module, "get_gcs_bytes", lambda path, bucket: texts[path].encode()
+        )
+        doc_cache, html_cache = self._caches()
+
+        older_text, newer_text = changes_module.get_diff_text(
+            older, newer, None, doc_cache, html_cache
+        )
+
+        assert (older_text, newer_text) == ("older raw text", "newer raw text")
+
+    def test_falls_back_to_txt_for_both_sides_when_only_one_has_html(self, monkeypatch):
+        # Regression guard: trimming exactly one side would diff trimmed
+        # text against untrimmed text, showing extraction-style noise as if
+        # it were a real content change. Both sides must fall back together.
+        CFG.USE_DIFF_TRIMMER = True
+        older = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        newer = {"path": "co1/privacy_policy/2", "formats": {"txt": {"extension": "txt"}}}
+        texts = {
+            "co1/privacy_policy/1.txt": "older raw text",
+            "co1/privacy_policy/2.txt": "newer raw text",
+        }
+        monkeypatch.setattr(
+            changes_module, "get_gcs_bytes", lambda path, bucket: texts[path].encode()
+        )
+        doc_cache, html_cache = self._caches()
+
+        older_text, newer_text = changes_module.get_diff_text(
+            older, newer, None, doc_cache, html_cache
+        )
+
+        assert (older_text, newer_text) == ("older raw text", "newer raw text")
+
+    def test_falls_back_to_txt_for_both_sides_when_trim_fails(self, monkeypatch):
+        CFG.USE_DIFF_TRIMMER = True
+        older = {"path": "co1/privacy_policy/1", "formats": {"html": {"extension": "html"}}}
+        newer = {"path": "co1/privacy_policy/2", "formats": {"html": {"extension": "html"}}}
+        texts = {
+            "co1/privacy_policy/1.txt": "older raw text",
+            "co1/privacy_policy/2.txt": "newer raw text",
+        }
+        monkeypatch.setattr(changes_module, "_fetch_html_trimmed", lambda *a, **k: None)
+        monkeypatch.setattr(
+            changes_module, "get_gcs_bytes", lambda path, bucket: texts[path].encode()
+        )
+        doc_cache, html_cache = self._caches()
+
+        older_text, newer_text = changes_module.get_diff_text(
+            older, newer, None, doc_cache, html_cache
+        )
+
+        assert (older_text, newer_text) == ("older raw text", "newer raw text")
+
+
+# --------------------------------------------------------------------------
 # create_changes_json -- local (non-Mongo) backend
 # --------------------------------------------------------------------------
 
@@ -269,6 +438,54 @@ class TestCreateChangesJsonLocal:
             (tmp_path / "changes" / "co1" / "privacy_policy").glob("*.CHANGES.json")
         )
         assert len(changes_files) == 3
+
+    def test_diff_trimmer_uses_trimmed_html_but_keeps_txt_path_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        CFG.USE_DIFF_TRIMMER = True
+
+        def doc_with_html(_id, path, date):
+            # A document needs a "txt" format to enter the pipeline at all
+            # (the $match/filter both backends apply); "html" is the extra
+            # format that makes it eligible for diff trimming.
+            doc = make_doc(_id, path, date)
+            doc["formats"]["html"] = {"extension": "html", "original_url": "https://example.com"}
+            return doc
+
+        documents = [
+            doc_with_html(ObjectId(), "co1/privacy_policy/1", datetime(2024, 1, 1, tzinfo=timezone.utc)),
+            doc_with_html(ObjectId(), "co1/privacy_policy/2", datetime(2024, 2, 1, tzinfo=timezone.utc)),
+        ]
+        self._setup(monkeypatch, tmp_path, documents)
+        monkeypatch.setattr(
+            changes_module,
+            "get_gcs_bytes",
+            lambda path, bucket: b"<nav>chrome</nav><p>real policy text</p>",
+        )
+        import source.boundary_classifier as bc
+
+        monkeypatch.setattr(
+            bc,
+            "extract_policy_text",
+            lambda html, threshold=None, model_path=None: "TRIMMED VERSION",
+        )
+        monkeypatch.setattr(changes_module, "save_db", lambda docs, path: None)
+
+        changes_module.create_changes_json()
+
+        changes_files = list(
+            (tmp_path / "changes" / "co1" / "privacy_policy").glob("*.CHANGES.json")
+        )
+        assert len(changes_files) == 1
+        data = json.loads(changes_files[0].read_text(encoding="utf-8"))
+
+        # The diff is built from the trimmed text, not the raw html.
+        diff_text = "".join(item[0] for item in data["diff"])
+        assert diff_text == "TRIMMED VERSION"
+        # But the recorded document paths still point at the canonical .txt
+        # capture path, regardless of what the diff was actually built from.
+        assert data["older_document"]["path"] == "co1/privacy_policy/1.txt"
+        assert data["newer_document"]["path"] == "co1/privacy_policy/2.txt"
 
     def test_duplicate_date_captures_ignore_the_older_one(
         self, monkeypatch, tmp_path, caplog

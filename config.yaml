@@ -52,7 +52,7 @@ USE_GCP: true
 # Whether to send Slack notifications on job completion and errors
 # Requires SLACK_WEBHOOK_URL to be set in the .env file
 # Defaults to false
-USE_SLACK: false
+USE_SLACK: true
 
 # Whether or not to create the .CHANGES.json files from the captures
 # This should be set to false if you don't need to compare the documents over time
@@ -64,16 +64,46 @@ CREATE_CHANGES: true
 # crawl itself didn't produce a .txt (see source/process.py ProcessCrawl.reconstruct_missing_txt) --
 # and reject captures it's confident are NOT an actual policy document (homepage, cookie
 # wall, 404 page, login wall, ...).
-# Requires a trained model at models/policy_classifier.joblib -- see scripts/train_policy_classifier.py
-# and scripts/build_policy_dataset.py. If USE_POLICY_CLASSIFIER is true but the model can't be
+# Requires a trained model at models/policy_classifier.joblib
+# If USE_POLICY_CLASSIFIER is true but the model can't be
 # loaded, the check fails open (the capture is allowed through) rather than blocking every capture.
 # Defaults to true
 USE_POLICY_CLASSIFIER: true
 
 # Policy-document probability threshold used by USE_POLICY_CLASSIFIER.
 # Captures scoring below this are rejected as non-policy documents.
-# Defaults to 0.3, matching the threshold validated in scripts/find_bad_captures.py
+# Defaults to 0.3
 POLICY_CLASSIFIER_THRESHOLD: 0.3
+
+# Whether to trim header/footer/nav boilerplate (source/boundary_classifier.py) out of the diff
+# written to .CHANGES.json, purely so the Comparison Tool's display reads cleaner -- a nav link
+# changing or a footer copyright year no longer shows up as noise alongside a real policy edit.
+# This is cosmetic only: it NEVER affects what gets archived, whether a capture is treated as
+# changed, or any other decision in the pipeline -- change-detection always runs on the full,
+# untrimmed text, exactly as before. Only applies when both captures being diffed have an html
+# format available; otherwise the diff falls back to the full untrimmed text as usual.
+# Requires a trained model at models/boundary_classifier.joblib
+USE_DIFF_TRIMMER: true
+
+# Minimum boilerplate-probability a block must score to be trimmed. Deliberately high (and only
+# ever applied to a leading/trailing run of blocks, never the middle of a document) so the trimmer
+# errs toward keeping real policy content over cutting boilerplate.
+# Defaults to 0.85
+DIFF_TRIMMER_THRESHOLD: 0.85
+
+# Memory safeguard: set this to match the container's actual memory limit (in MB) so the
+# process can self-impose a soft cap (see MEMORY_SOFT_LIMIT_RATIO below) below that hard
+# limit. Without this, a single oversized document can push the process to the container's
+# real memory limit, where the OS OOM-kills the whole run with no chance to recover. With it,
+# Python raises a catchable MemoryError instead, so one bad document fails and gets logged
+# rather than taking down every in-flight worker.
+# POSIX-only (no-op on Windows/local dev). Defaults to 0, which disables the safeguard.
+# Set to 8192 to match an 8GiB Cloud Run container.
+MEMORY_LIMIT_MB: 16384
+
+# Fraction of MEMORY_LIMIT_MB used as the actual soft cap.
+# Defaults to 0.85 (e.g. ~6.8GB soft cap on an 8GiB / 8192MB container)
+MEMORY_SOFT_LIMIT_RATIO: 0.85
 
 # Prioritization of the selected companies to establish frequency of captures
 # The higher the value, the more frequently the capture will be made

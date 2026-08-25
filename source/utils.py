@@ -15,6 +15,7 @@ import json
 import time
 import random
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import urllib.request
 
 # Local Imports
@@ -248,18 +249,38 @@ def update_Mongo(results: list, collection):
         raise e
 
 
-def get_gcs_bytes(gcp_path, bucket) -> bytes:
+def _read_local_file_bytes(path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def get_gcs_bytes(gcp_path, bucket, timeout: float = 120) -> bytes:
     """
     Returns the bytes of a file in a Google Cloud Storage bucket or from a local directory if USE_GCP is False
+
+    Raises:
+      TimeoutError: If the read doesn't complete within `timeout` seconds. Reads against the
+        GCS FUSE mount (used when IN_CLOUD) are plain filesystem calls with no built-in timeout,
+        so unlike the direct GCS API call below, they can hang indefinitely on a stalled mount.
+        The read is run in a background thread so a stuck call can be abandoned on timeout
+        instead of blocking the whole pipeline.
     """
     logger.info(f"Downloading {gcp_path} from GCS...")
     if CFG.IN_CLOUD or not CFG.USE_GCP:
-        with open(join_path(CFG.CAPTURES_DIR, gcp_path), "rb") as f:
-            file_bytes = f.read()
-        return file_bytes
+        local_path = join_path(CFG.CAPTURES_DIR, gcp_path)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_read_local_file_bytes, local_path)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            raise TimeoutError(
+                f"Reading {local_path} from the GCS FUSE mount timed out after {timeout}s"
+            )
+        finally:
+            executor.shutdown(wait=False)
     else:
         blob = bucket.blob(str(gcp_path))
-        return blob.download_as_bytes(timeout=120)
+        return blob.download_as_bytes(timeout=timeout)
 
 
 def decode_bytes(bytes) -> str:

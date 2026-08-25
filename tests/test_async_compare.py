@@ -136,45 +136,8 @@ class TestReadWaczFile:
 
 
 # --------------------------------------------------------------------------
-# compare_warc_files / compare_html_files / compare_txt_files
+# compare_html_files / compare_txt_files
 # --------------------------------------------------------------------------
-
-
-class TestCompareWarcFiles:
-    def test_identical_content_not_changed(self, tmp_path):
-        zip_bytes = build_zip(html_content=b"<p>Same text here for both files</p>")
-        local_path = tmp_path / "capture.wacz"
-        local_path.write_bytes(zip_bytes)
-
-        assert ac.compare_warc_files(zip_bytes, local_path, "old.wacz") is False
-
-    def test_different_content_is_changed(self, tmp_path):
-        local_bytes = build_zip(
-            html_content=b"<p>Local version of the document text</p>"
-        )
-        gcs_bytes = build_zip(
-            html_content=b"<p>Totally different remote document text</p>"
-        )
-        local_path = tmp_path / "capture.wacz"
-        local_path.write_bytes(local_bytes)
-
-        assert ac.compare_warc_files(gcs_bytes, local_path, "old.wacz") is True
-
-    def test_warc_gz_suffix_detected_independently_for_local_and_gcp(self, tmp_path):
-        # Local file is a plain wacz, GCP path claims to be warc.gz -- each
-        # side's mode is derived from its own filename/path suffix.
-        local_bytes = build_zip(html_content=b"<p>Shared identical text content</p>")
-        local_path = tmp_path / "capture.wacz"
-        local_path.write_bytes(local_bytes)
-
-        inner_zip = build_zip(html_content=b"<p>Shared identical text content</p>")
-        gz_buf = io.BytesIO()
-        with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
-            gz.write(inner_zip)
-
-        assert (
-            ac.compare_warc_files(gz_buf.getvalue(), local_path, "old.warc.gz") is False
-        )
 
 
 class TestCompareHtmlFiles:
