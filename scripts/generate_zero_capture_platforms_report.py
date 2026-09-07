@@ -118,7 +118,6 @@ def main():
     live = fetch_live_data(args.mongodb_url, args.db_name)
     companies = live["companies"]
     current_counts = live["current_counts"]
-    current_latest = live["current_latest"]
     print(f"Loaded {len(companies)} companies")
 
     deletion_history = build_deletion_history(Path(args.data_dir))
