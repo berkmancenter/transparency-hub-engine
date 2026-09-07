@@ -515,11 +515,7 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
     if not data_quality_check(text):
         return False
 
-    if format == "txt":
-        # Only the txt format runs the classifier -- it was trained on text
-        # captured directly by the live pipeline, and running it against
-        # text extracted here from html/pdf/warc.json purely for quality
-        # checking would feed it a noisier distribution than it was trained on.
+    if format in ("txt", "warc.json"):
         return passes_policy_document_check(text)
 
     return True

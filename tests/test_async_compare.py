@@ -408,6 +408,23 @@ class TestValidateFilesDispatch:
 
         assert ac.validate_file(path, "txt") is False
 
+    def test_warc_json_format_defers_to_policy_classifier_check(
+        self, tmp_path, monkeypatch
+    ):
+        # warc.json is the crawler's own extracted-text fallback used when a
+        # site stops yielding real txt/html/pdf captures (e.g. a bot-check
+        # interstitial). It must be gated by the same classifier as txt, or
+        # interstitial noise (a fresh Ray ID on every request) gets treated
+        # as a real content change on every sync.
+        path = tmp_path / "doc.warc.json"
+        path.write_text(
+            json.dumps({"records": [{"content": "some perfectly fine text"}]})
+        )
+        monkeypatch.setattr(ac, "data_quality_check", lambda text: True)
+        monkeypatch.setattr(ac, "passes_policy_document_check", lambda text: False)
+
+        assert ac.validate_file(path, "warc.json") is False
+
     def test_timeout_returns_false(self, monkeypatch):
         def slow(local_path, format):
             import time as t

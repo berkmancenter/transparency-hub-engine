@@ -61,10 +61,14 @@ class BrowsertrixCrawler:
             "--detachedHTML",  # Generate detached HTML (Custom Fork Param)
             "--behaviors",
             "autoscroll,autoplay,autofetch",  # Auto behaviors
-            "--behavior-timeout",
+            "--behaviorTimeout",
             "30",
             "--timeout",
-            "90",
+            "105",
+            "--postLoadDelay",
+            "8",
+            "--pageExtraDelay",
+            "8",
         ]
 
         # With plans to add more modes, this will need to be expanded, but for now document_capture is the only valid mode
