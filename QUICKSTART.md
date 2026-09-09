@@ -97,8 +97,14 @@ Each company document should look like this:
   "name": "Transparency Hub",
   "url": "https://hub.transparency.berkmancenter.org/",
   "doc_urls": {
-    "Privacy Policy": "https://hub.transparency.berkmancenter.org/legal/privacy",
-    "Terms of Use": "https://hub.transparency.berkmancenter.org/legal/terms"
+    "Privacy Policy": {
+      "name": "Privacy Policy",
+      "urls": ["https://hub.transparency.berkmancenter.org/legal/privacy"]
+    },
+    "Terms of Use": {
+      "name": "Terms of Use",
+      "urls": ["https://hub.transparency.berkmancenter.org/legal/terms"]
+    }
   }
 }
 ```
@@ -135,8 +141,14 @@ Your `companies.json` should be a JSON array following the same structure as the
     "name": "Transparency Hub",
     "url": "https://hub.transparency.berkmancenter.org/", *(optional)*
     "doc_urls": {
-      "Privacy Policy": "https://hub.transparency.berkmancenter.org/legal/privacy",
-      "Terms of Use": "https://hub.transparency.berkmancenter.org/legal/terms"
+      "Privacy Policy": {
+        "name": "Privacy Policy",
+        "urls": ["https://hub.transparency.berkmancenter.org/legal/privacy"]
+      },
+      "Terms of Use": {
+        "name": "Terms of Use",
+        "urls": ["https://hub.transparency.berkmancenter.org/legal/terms"]
+      }
     }
   }
 ]

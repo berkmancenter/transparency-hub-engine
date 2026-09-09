@@ -161,6 +161,12 @@ def distinct_homepage_urls(docs: list[dict]) -> list[str]:
     domains = set()
     for doc in docs:
         original_url = doc.get("formats", {}).get("txt", {}).get("original_url", "")
+        # original_url is a list[str] (order preserved) for documents captured
+        # after the multi-url pipeline change, and a plain string for documents
+        # captured before it -- only the domain is needed here, so any one url
+        # in the list works; use the first.
+        if isinstance(original_url, list):
+            original_url = original_url[0] if original_url else ""
         parsed = urlparse(original_url)
         if parsed.scheme and parsed.netloc:
             domains.add(f"{parsed.scheme}://{parsed.netloc}/")

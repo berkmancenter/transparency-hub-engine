@@ -293,7 +293,7 @@ class TestDataQualityCheck:
 
 
 # --------------------------------------------------------------------------
-# compare_files / _compare_files_sync / compare_files_async
+# compare_files / _compare_files_sync
 # --------------------------------------------------------------------------
 
 
@@ -553,6 +553,50 @@ class TestReconstructTextFromFormat:
 
         text = ac.reconstruct_text_from_format(
             raw, "warc.json", "warc.json", originalUrl="https://no-match.example"
+        )
+
+        assert text == "first\n\nsecond"
+
+    def test_warc_json_matches_any_url_in_a_multi_url_list(self):
+        # A document captured from more than one seed url (a page split
+        # across multiple urls) should pull in every record that matches any
+        # of them, not just the first.
+        raw = json.dumps(
+            {
+                "records": [
+                    {"urls": ["https://a.example/other"], "content": "other page"},
+                    {"urls": ["https://a.example/1"], "content": "page one"},
+                    {"urls": ["https://a.example/2"], "content": "page two"},
+                ]
+            }
+        ).encode()
+
+        text = ac.reconstruct_text_from_format(
+            raw,
+            "warc.json",
+            "warc.json",
+            originalUrl=["https://a.example/1", "https://a.example/2"],
+        )
+
+        assert text == "page one\n\npage two"
+
+    def test_warc_json_falls_back_to_joining_all_records_when_no_url_in_list_matches(
+        self,
+    ):
+        raw = json.dumps(
+            {
+                "records": [
+                    {"urls": ["https://a.example/1"], "content": "first"},
+                    {"urls": ["https://a.example/2"], "content": "second"},
+                ]
+            }
+        ).encode()
+
+        text = ac.reconstruct_text_from_format(
+            raw,
+            "warc.json",
+            "warc.json",
+            originalUrl=["https://no-match.example", "https://also-no-match.example"],
         )
 
         assert text == "first\n\nsecond"

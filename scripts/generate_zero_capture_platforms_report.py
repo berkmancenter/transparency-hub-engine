@@ -131,7 +131,7 @@ def main():
         company_id = str(company["_id"])
         doc_urls = company.get("doc_urls", {}) or {}
         company_gaps = []
-        for doc_type_label, url in doc_urls.items():
+        for doc_type_label, doc_entry in doc_urls.items():
             total_configured_pairs += 1
             norm_type = normalize_type(doc_type_label)
             key = (company_id, norm_type)
@@ -147,7 +147,7 @@ def main():
                 company_gaps.append(
                     {
                         "doc_type": doc_type_label,
-                        "url": url,
+                        "url": "; ".join(doc_entry.get("urls", [])),
                         "detail": detail,
                         "had_history": bool(reasons),
                     }

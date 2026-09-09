@@ -7,6 +7,7 @@
 
 # Imports
 import concurrent.futures
+import threading
 import time
 from typing import List, Dict
 import sys
@@ -31,8 +32,39 @@ class BrowsertrixCrawler:
     ):
         self.dockerImage = dockerImage
         self.mode = mode
+        # Lazily created and cached on first use (see _get_docker_client /
+        # _get_jobs_client below) -- this instance persists for the whole
+        # pipeline run and is reused across every crawl (run_single_crawl is
+        # called once per url group), so reconnecting the Docker/Cloud Run
+        # SDK client on every single call was pure overhead. Guarded by a
+        # lock since run_single_crawl runs concurrently from multiple worker
+        # threads -- same lazy-singleton pattern source/policy_classifier.py
+        # and source/boundary_classifier.py use to cache their models.
+        self._dockerClient = None
+        self._jobsClient = None
+        self._clientLock = threading.Lock()
 
-    def create_crawl_command(self, url: str, crawlName: str) -> List[str]:
+    def _get_docker_client(self):
+        """Lazily creates and caches the Docker SDK client, reused across every crawl this instance runs."""
+        if self._dockerClient is None:
+            with self._clientLock:
+                if self._dockerClient is None:
+                    import docker  # type: ignore
+
+                    self._dockerClient = docker.from_env()
+        return self._dockerClient
+
+    def _get_jobs_client(self):
+        """Lazily creates and caches the Cloud Run Jobs client, reused across every crawl this instance runs."""
+        if self._jobsClient is None:
+            with self._clientLock:
+                if self._jobsClient is None:
+                    from google.cloud import run_v2  # type: ignore
+
+                    self._jobsClient = run_v2.JobsClient()
+        return self._jobsClient
+
+    def create_crawl_command(self, urls: List[str], crawlName: str) -> List[str]:
         """ """
         if CFG.IN_LOCAL:
             # These options are only used when running this as a python script
@@ -52,10 +84,13 @@ class BrowsertrixCrawler:
             cmd = []
 
         # These are the base options for running the fork programmatically
+        cmd = cmd + ["crawl"]
+        # A doc type can list more than one url (a document split across pages) --
+        # repeat --url per url rather than relying on yargs' array-flag value
+        # collection, so each url is unambiguous regardless of position
+        for url in urls:
+            cmd = cmd + ["--url", url]
         cmd = cmd + [
-            "crawl",
-            "--url",
-            url,
             "--collection",
             crawlName,
             "--detachedHTML",  # Generate detached HTML (Custom Fork Param)
@@ -99,12 +134,12 @@ class BrowsertrixCrawler:
 
     def run_single_crawl(self, pData: Dict, crawlName: str) -> List[Dict]:
         """ """
-        url = pData["url"]
+        urls = pData["urls"]
         pValues = pData["pValues"]
 
-        cmd = self.create_crawl_command(url, crawlName)
+        cmd = self.create_crawl_command(urls, crawlName)
 
-        logger.info(f"Starting crawl '{crawlName}' with {url}")
+        logger.info(f"Starting crawl '{crawlName}' with {', '.join(urls)}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         startTime = time.time()
@@ -138,7 +173,7 @@ class BrowsertrixCrawler:
                         {
                             "crawl_name": crawlName,
                             "success": True,
-                            "url": url,
+                            "urls": urls,
                             "objId": pValue["objId"],
                             "name": pValue["name"],
                             "pType": pValue["pType"],
@@ -157,7 +192,7 @@ class BrowsertrixCrawler:
                         {
                             "crawl_name": crawlName,
                             "success": False,
-                            "url": url,
+                            "urls": urls,
                             "pValues": pValues,
                             "duration": duration,
                             "error": result.returncode,
@@ -169,7 +204,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": "Timeout after 20 minutes",
                     }
@@ -182,7 +217,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }
@@ -191,8 +226,8 @@ class BrowsertrixCrawler:
         elif CFG.IN_DOCKER:
             import docker  # type: ignore
 
-            # Open a docker client to run the crawler
-            client = docker.from_env()
+            # Reuse the cached docker client rather than reconnecting per crawl
+            client = self._get_docker_client()
 
             try:
                 container = client.containers.run(
@@ -220,7 +255,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": True,
-                        "url": url,
+                        "urls": urls,
                         "objId": pValue["objId"],
                         "name": pValue["name"],
                         "pType": pValue["pType"],
@@ -242,7 +277,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "duration": duration,
                         "error": e.exit_status,
@@ -256,7 +291,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }
@@ -265,8 +300,8 @@ class BrowsertrixCrawler:
         elif CFG.IN_CLOUD:
             from google.cloud import run_v2  # type: ignore
 
-            # Open a google client to run the crawler
-            client = run_v2.JobsClient()
+            # Reuse the cached jobs client rather than reconnecting per crawl
+            client = self._get_jobs_client()
 
             job_path = f"projects/{CFG.GCLOUD_PROJECT}/locations/{CFG.GCLOUD_REGION}/jobs/{CFG.GCLOUD_JOB}"
 
@@ -296,7 +331,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": True,
-                        "url": url,
+                        "urls": urls,
                         "objId": pValue["objId"],
                         "name": pValue["name"],
                         "pType": pValue["pType"],
@@ -310,7 +345,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": f"Timeout after {CFG.TIMEOUT}s",
                     }
@@ -323,7 +358,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }

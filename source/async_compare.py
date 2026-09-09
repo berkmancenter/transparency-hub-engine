@@ -8,6 +8,7 @@
 import zipfile
 import gzip
 import io
+import os
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString
 import PyPDF2
@@ -15,7 +16,7 @@ from rapidfuzz import fuzz
 import re
 import json
 import langdetect
-import asyncio
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -372,31 +373,49 @@ def extract_text_from_pdf_bytes(rawBytes: bytes) -> str:
     return "".join(page.extract_text() for page in reader.pages)
 
 
-def extract_text_from_warc_json_bytes(rawBytes: bytes, originalUrl: str = "") -> str:
+def extract_text_from_warc_json_bytes(
+    rawBytes: bytes, originalUrl: str | list[str] = ""
+) -> str:
     """
     Extracts text from a warc.json file's raw bytes. warc.json's "records"
     list has one entry per unique page visited during the crawl, so this
-    prefers the record whose urls include originalUrl (the actual target
-    page) over blindly concatenating every page the crawler happened to visit.
+    prefers the records whose urls include one of originalUrl's (the actual
+    target page(s)) over blindly concatenating every page the crawler
+    happened to visit. A document can be captured from more than one seed
+    url (a document split across pages), in which case every matching
+    record's content is joined -- mirroring how a directly-captured .txt
+    merges multiple pages (see process.py ProcessCrawl.merge_txt_files).
 
     Args:
       rawBytes (bytes): The raw bytes of a warc.json file.
-      originalUrl (str): The document's own source URL, used to select the
-        matching record. If omitted or not found, every record is joined.
+      originalUrl (str | list[str]): The document's own source url(s), used
+        to select matching records. Accepts a single url (legacy captures
+        stored it as a plain string) or a list. If omitted or none are
+        found, every record is joined instead.
 
     Returns:
       str: The extracted text.
     """
     data = json.loads(rawBytes)
     records = data.get("records", [])
-    for record in records:
-        if originalUrl and originalUrl in record.get("urls", []):
-            return record.get("content", "")
+
+    targetUrls = [originalUrl] if isinstance(originalUrl, str) else list(originalUrl)
+    targetUrls = [url for url in targetUrls if url]
+
+    if targetUrls:
+        matched = [
+            record.get("content", "")
+            for record in records
+            if any(url in record.get("urls", []) for url in targetUrls)
+        ]
+        if matched:
+            return "\n\n".join(matched)
+
     return "\n\n".join(record.get("content", "") for record in records)
 
 
 def reconstruct_text_from_format(
-    rawBytes: bytes, format: str, extension: str, originalUrl: str = ""
+    rawBytes: bytes, format: str, extension: str, originalUrl: str | list[str] = ""
 ) -> str:
     """
     Extracts text from an already-captured format, used to backfill a
@@ -408,8 +427,10 @@ def reconstruct_text_from_format(
         "warc.json", or "warc").
       extension (str): The file extension of the captured format, used to
         distinguish "warc" stored as .wacz vs .warc.gz.
-      originalUrl (str): The document's own source URL, used to disambiguate
-        warc.json records.
+      originalUrl (str | list[str]): The document's own source url(s), used
+        to disambiguate warc.json records. Accepts a single url (legacy
+        captures) or a list (current captures, which can have more than one
+        seed url).
 
     Returns:
       str: The extracted text, or an empty string for an unrecognized format.
@@ -465,24 +486,6 @@ def _compare_files_sync(localPath: Path, gcpPath: str, format: str, bucket) -> b
     return False
 
 
-async def compare_files_async(
-    localPath: Path, gcpPath: str, format: str, bucket, timeout: float = 300
-) -> bool:
-    loop = asyncio.get_running_loop()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                None, _compare_files_sync, localPath, gcpPath, format, bucket
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"Comparison timed out after {timeout}s for {localPath} ({format})"
-        )
-        return False
-
-
 def _validate_file_sync(localPath: Path, format: str) -> bool:
     if format == "warc":
         return True
@@ -521,27 +524,25 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
     return True
 
 
-async def validate_file_async(
-    localPath: Path, format: str, timeout: float = 300
-) -> bool:
-    loop = asyncio.get_running_loop()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, _validate_file_sync, localPath, format),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"Validation timed out after {timeout}s for {localPath} ({format})"
-        )
-        return False
+# compare_files/validate_file are each called synchronously from a worker
+# thread that's already part of pipeline.py's own ThreadPoolExecutor -- this
+# executor exists purely to bound a single blocking call with a timeout, not
+# to add concurrency (there was never any actual concurrent work happening
+# inside the old asyncio event loop these replaced, just one awaited task).
+# Sized like asyncio's own default executor (min(32, cpu_count + 4)) so it
+# offers the same concurrency headroom, but created once at import time
+# instead of a fresh event loop + default executor on every single call.
+_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(32, (os.cpu_count() or 1) + 4),
+    thread_name_prefix="compare-timeout",
+)
 
 
 def compare_files(
     localPath: Path, gcpPath: str, format: str, bucket, timeout: float = 300
 ) -> bool:
     """
-    Wrapper function for compare_files_async, allows for setting a timeout in case the file processing pipeline hangs
+    Wrapper for _compare_files_sync, allows for setting a timeout in case the file processing pipeline hangs
 
     Args:
       localPath (str): Path to the local file
@@ -550,16 +551,32 @@ def compare_files(
       bucket (str): Name of the GCP bucket (None if running in Google Cloud)
       timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    return asyncio.run(compare_files_async(localPath, gcpPath, format, bucket, timeout))
+    future = _TIMEOUT_EXECUTOR.submit(
+        _compare_files_sync, localPath, gcpPath, format, bucket
+    )
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            f"Comparison timed out after {timeout}s for {localPath} ({format})"
+        )
+        return False
 
 
 def validate_file(localPath, format, timeout=300.0):
     """
-    Wrapper function for validate_file_async, allows for setting a timeout in case the file processing pipeline hangs
+    Wrapper for _validate_file_sync, allows for setting a timeout in case the file processing pipeline hangs
 
     Args:
       localPath (str): Path to the local file
       format (str): Format of the file
       timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    return asyncio.run(validate_file_async(localPath, format, timeout))
+    future = _TIMEOUT_EXECUTOR.submit(_validate_file_sync, localPath, format)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            f"Validation timed out after {timeout}s for {localPath} ({format})"
+        )
+        return False

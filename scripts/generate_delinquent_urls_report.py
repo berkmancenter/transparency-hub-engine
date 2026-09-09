@@ -90,12 +90,30 @@ def configured_url_for(company: dict, doc_type: str) -> str:
     Policy"), while documents_v2's "type" field is that same name normalized
     the way source.utils.format_data does it: spaces to underscores,
     lowercased. Normalize doc_urls the same way before looking up doc_type.
+
+    Each doc_urls entry is {"name": ..., "urls": [...]} and can list more
+    than one url, so join them for display.
     """
     normalized = {
-        key.replace(" ", "_").lower(): url
-        for key, url in company.get("doc_urls", {}).items()
+        key.replace(" ", "_").lower(): entry.get("urls", [])
+        for key, entry in company.get("doc_urls", {}).items()
     }
-    return normalized.get(doc_type, "unknown")
+    urls = normalized.get(doc_type)
+    if not urls:
+        return "unknown"
+    return "; ".join(urls)
+
+
+def display_original_url(value) -> str:
+    """
+    documents_v2's formats.txt.original_url is a plain string for documents
+    captured before the multi-url pipeline change, and a list[str] (order
+    preserved) for documents captured after it -- normalize both to a single
+    display string, joining a list the same way configured_url_for() does.
+    """
+    if isinstance(value, list):
+        return "; ".join(value)
+    return value
 
 
 def format_date(doc: dict | None) -> str:
@@ -160,10 +178,12 @@ def render_report(rows: list[dict], context: dict) -> str:
 
         captured_urls = sorted(
             {
-                docs_by_id.get(row["_id"], {})
-                .get("formats", {})
-                .get("txt", {})
-                .get("original_url", "unknown")
+                display_original_url(
+                    docs_by_id.get(row["_id"], {})
+                    .get("formats", {})
+                    .get("txt", {})
+                    .get("original_url", "unknown")
+                )
                 for row in group
             }
         )

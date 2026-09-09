@@ -3,8 +3,10 @@
 # format is actually new content worth keeping.
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -20,11 +22,20 @@ def make_crawl_result(crawl_name=None, **overrides):
         "crawl_name": crawl_name or f"batch_1_{TIMESTAMP}",
         "objId": "co1",
         "pType": "privacy_policy",
-        "url": "https://example.com/privacy",
+        "urls": ["https://example.com/privacy"],
         "success": True,
     }
     result.update(overrides)
     return result
+
+
+def _write_with_mtime(path: Path, content: str, mtime_offset: int) -> None:
+    """Writes content and sets an explicit, distinguishable mtime -- avoids
+    flaky ordering assertions that would otherwise depend on filesystem
+    timestamp resolution / write timing."""
+    path.write_text(content)
+    stamp = TIMESTAMP + mtime_offset
+    os.utime(path, (stamp, stamp))
 
 
 @pytest.fixture
@@ -152,6 +163,111 @@ class TestCreateWarcJson:
         assert result["records"][0]["urls"] == ["https://a.example/2"]
 
 
+class TestCheckForFailedCaptures:
+    def test_notifies_slack_on_404_status(self, processor, crawl_dirs, monkeypatch):
+        _, _, _, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example/missing", "status": 404})
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+
+        messages = []
+        monkeypatch.setattr(
+            process_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+
+        processor.check_for_failed_captures()
+
+        assert len(messages) == 1
+        assert "https://a.example/missing" in messages[0]
+        assert "404" in messages[0]
+
+    def test_collects_404s_from_both_page_files(self, processor, crawl_dirs, monkeypatch):
+        _, _, _, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example/1", "status": 200})
+        )
+        (j_dir / "extraPages.jsonl").write_text(
+            json.dumps({"url": "https://a.example/2", "status": 404})
+        )
+
+        messages = []
+        monkeypatch.setattr(
+            process_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+
+        processor.check_for_failed_captures()
+
+        assert len(messages) == 1
+        assert "https://a.example/2" in messages[0]
+        assert "https://a.example/1" not in messages[0]
+
+    def test_no_notification_when_no_404s(self, processor, crawl_dirs, monkeypatch):
+        _, _, _, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example/1", "status": 200})
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+
+        messages = []
+        monkeypatch.setattr(
+            process_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+
+        processor.check_for_failed_captures()
+
+        assert messages == []
+
+    def test_no_notification_when_page_files_missing(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        messages = []
+        monkeypatch.setattr(
+            process_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+
+        processor.check_for_failed_captures()
+
+        assert messages == []
+
+    def test_skips_malformed_lines(self, processor, crawl_dirs, monkeypatch):
+        _, _, _, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            "\n".join(
+                [
+                    "{not valid json",
+                    json.dumps({"url": "https://a.example/1", "status": 404}),
+                ]
+            )
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+
+        messages = []
+        monkeypatch.setattr(
+            process_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+
+        processor.check_for_failed_captures()
+
+        assert len(messages) == 1
+        assert "https://a.example/1" in messages[0]
+
+    def test_notify_slack_exception_is_caught(self, processor, crawl_dirs, monkeypatch):
+        _, _, _, j_dir = crawl_dirs
+        (j_dir / "pages.jsonl").write_text(
+            json.dumps({"url": "https://a.example/missing", "status": 404})
+        )
+        (j_dir / "extraPages.jsonl").write_text("")
+
+        def boom(msg):
+            raise RuntimeError("slack is down")
+
+        monkeypatch.setattr(process_module, "notify_slack", boom)
+
+        # Must not raise
+        processor.check_for_failed_captures()
+
+
 class TestProcessFormat:
     def test_txt_found_and_new_sets_confirmed_new(
         self, processor, crawl_dirs, monkeypatch
@@ -168,11 +284,80 @@ class TestProcessFormat:
         assert processor.results == []
         assert processor.formats["txt"] == {
             "extension": "txt",
-            "original_url": processor.crawlResult["url"],
+            "original_url": processor.crawlResult["urls"],
         }
         copied = processor.sDir / f"{processor.cTimestamp}.txt"
         assert copied.exists()
         assert processor.fileNames == [copied]
+
+    def test_txt_merges_multiple_pages_in_mtime_order(
+        self, processor, crawl_dirs, monkeypatch
+    ):
+        # A crawl with more than one seed url (or extra in-scope pages)
+        # produces one .txt per page -- all of them must be merged into the
+        # captured document instead of arbitrarily keeping just one.
+        # Filenames are deliberately in the opposite order of their mtimes,
+        # so this only passes if merge order actually follows mtime rather
+        # than filename.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        _write_with_mtime(a_dir / "z_page.txt", "first page text", 100)
+        _write_with_mtime(a_dir / "a_page.txt", "second page text", 200)
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.process_format(("txt", a_dir))
+
+        copied = processor.sDir / f"{processor.cTimestamp}.txt"
+        assert copied.read_text() == "first page text\n\nsecond page text"
+
+    def test_second_pvalue_sharing_a_crawl_does_not_get_corrupted_txt(
+        self, crawl_dirs, fake_collection, monkeypatch
+    ):
+        # Mirrors what pipeline.process_document actually does when
+        # format_data collates two pValues onto the same url group: a
+        # separate ProcessCrawl per pValue, all sharing the same crawl_name
+        # (and therefore the same aDir). The second pValue's merge must not
+        # re-glob and fold in the first pValue's already-merged output.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "a_page.txt").write_text("first")
+        (a_dir / "b_page.txt").write_text("second")
+
+        crawl_result_a = make_crawl_result(objId="co-a", pType="privacy_policy")
+        crawl_result_b = make_crawl_result(objId="co-b", pType="terms_of_service")
+        processor_a = ProcessCrawl(crawl_result_a, fake_collection, googleBucket=None)
+        processor_b = ProcessCrawl(crawl_result_b, fake_collection, googleBucket=None)
+        monkeypatch.setattr(processor_a, "verify_content", lambda fmt, url, path: True)
+        monkeypatch.setattr(processor_b, "verify_content", lambda fmt, url, path: True)
+
+        processor_a.process_format(("txt", a_dir))
+        processor_b.process_format(("txt", a_dir))
+
+        assert (
+            processor_a.sDir / f"{processor_a.cTimestamp}.txt"
+        ).read_text() == "first\n\nsecond"
+        assert (
+            processor_b.sDir / f"{processor_b.cTimestamp}.txt"
+        ).read_text() == "first\n\nsecond"
+
+    def test_original_url_preserves_given_multi_url_order(
+        self, crawl_dirs, fake_collection, monkeypatch
+    ):
+        # original_url is stored as a list going forward -- it must reflect
+        # the seed urls in the order the doc_urls entry gave them (not
+        # alphabetical, or any other reordering).
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        ordered_urls = [
+            "https://example.com/z",
+            "https://example.com/a",
+            "https://example.com/m",
+        ]
+        crawl_result = make_crawl_result(urls=ordered_urls)
+        processor = ProcessCrawl(crawl_result, fake_collection, googleBucket=None)
+        (a_dir / "capture.txt").write_text("hello")
+        monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
+
+        processor.process_format(("txt", a_dir))
+
+        assert processor.formats["txt"]["original_url"] == ordered_urls
 
     def test_txt_not_new_increments_fail_counter(
         self, processor, crawl_dirs, monkeypatch
@@ -197,6 +382,61 @@ class TestProcessFormat:
         assert processor.failCounter == 1
         assert processor.formats == {}
         assert processor.results == []
+
+    def test_missing_txt_files_increments_fail_counter(self, processor, crawl_dirs):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        # No .txt file was created for this crawl.
+
+        processor.process_format(("txt", a_dir))
+
+        assert processor.failCounter == 1
+        assert processor.formats == {}
+        assert processor.results == []
+
+
+class TestMergeTxtFiles:
+    def test_merges_in_mtime_order_and_writes_under_sDir(self, processor, crawl_dirs):
+        # Written under self.sDir (unique per company/pType), NOT iDir --
+        # iDir gets re-globbed by every pValue collated onto this crawl, so
+        # writing the merge output there would let a later pValue's merge
+        # re-ingest an earlier pValue's already-merged file. Filenames are
+        # deliberately reversed relative to mtime, so this only passes if
+        # merge order actually follows mtime.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        _write_with_mtime(a_dir / "b_page.txt", "first", 100)
+        _write_with_mtime(a_dir / "a_page.txt", "second", 200)
+
+        mergedPath = processor.merge_txt_files(a_dir)
+
+        assert mergedPath == processor.sDir / f"{processor.cTimestamp}.merged.txt"
+        assert mergedPath.read_text() == "first\n\nsecond"
+
+    def test_does_not_write_into_the_globbed_directory(self, processor, crawl_dirs):
+        # Regression guard for the cross-pValue corruption bug: a second call
+        # against the same iDir must see the same two source files, not the
+        # first call's own merged output folded back in as a third page.
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        _write_with_mtime(a_dir / "a_page.txt", "first", 100)
+        _write_with_mtime(a_dir / "b_page.txt", "second", 200)
+
+        processor.merge_txt_files(a_dir)
+        secondMerge = processor.merge_txt_files(a_dir)
+
+        assert secondMerge.read_text() == "first\n\nsecond"
+
+    def test_single_file_is_returned_unchanged(self, processor, crawl_dirs):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+        (a_dir / "capture.txt").write_text("only page")
+
+        mergedPath = processor.merge_txt_files(a_dir)
+
+        assert mergedPath.read_text() == "only page"
+
+    def test_raises_when_no_txt_files_found(self, processor, crawl_dirs):
+        _, _c_dir, a_dir, _j_dir = crawl_dirs
+
+        with pytest.raises(Exception):
+            processor.merge_txt_files(a_dir)
 
     def test_confirmed_new_short_circuits_verify_content(
         self, processor, crawl_dirs, monkeypatch
@@ -234,7 +474,7 @@ class TestProcessFormat:
         assert processor.results == []
         assert processor.formats["warc"] == {
             "extension": "wacz",
-            "original_url": processor.crawlResult["url"],
+            "original_url": processor.crawlResult["urls"],
         }
 
     def test_warc_json_branch_builds_and_writes_file(
@@ -263,13 +503,13 @@ class TestProcessFormat:
 
 
 class TestVerifyContent:
-    ORIGINAL_URL = "https://example.com/privacy"
+    ORIGINAL_URLS: ClassVar[list[str]] = ["https://example.com/privacy"]
 
     def test_returns_false_when_validation_fails(self, processor, monkeypatch):
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: False)
 
         assert (
-            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
             is False
         )
 
@@ -278,7 +518,7 @@ class TestVerifyContent:
         monkeypatch.setattr(process_module, "validate_file", lambda path, fmt: True)
 
         assert (
-            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
             is True
         )
 
@@ -291,7 +531,7 @@ class TestVerifyContent:
                 "date_fetched": "2024-01-01",
                 "path": "co1/privacy_policy/123",
                 "formats": {
-                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URLS}
                 },
             }
         )
@@ -299,7 +539,7 @@ class TestVerifyContent:
         monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: True)
 
         assert (
-            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
             is True
         )
 
@@ -312,7 +552,7 @@ class TestVerifyContent:
                 "date_fetched": "2024-01-01",
                 "path": "co1/privacy_policy/123",
                 "formats": {
-                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URLS}
                 },
             }
         ]
@@ -320,7 +560,7 @@ class TestVerifyContent:
         monkeypatch.setattr(process_module, "compare_files", lambda *a, **k: False)
 
         assert (
-            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
             is False
         )
 
@@ -343,7 +583,7 @@ class TestVerifyContent:
                 "formats": {
                     "warc.json": {
                         "extension": "warc.json",
-                        "original_url": self.ORIGINAL_URL,
+                        "original_url": self.ORIGINAL_URLS,
                     }
                 },
             }
@@ -355,7 +595,7 @@ class TestVerifyContent:
 
         assert (
             processor.verify_content(
-                "warc.json", self.ORIGINAL_URL, Path("dummy.warc.json")
+                "warc.json", self.ORIGINAL_URLS, Path("dummy.warc.json")
             )
             is False
         )
@@ -373,7 +613,7 @@ class TestVerifyContent:
                 "formats": {
                     "warc.json": {
                         "extension": "warc.json",
-                        "original_url": self.ORIGINAL_URL,
+                        "original_url": self.ORIGINAL_URLS,
                     }
                 },
             }
@@ -383,7 +623,7 @@ class TestVerifyContent:
 
         assert (
             processor.verify_content(
-                "warc.json", self.ORIGINAL_URL, Path("dummy.warc.json")
+                "warc.json", self.ORIGINAL_URLS, Path("dummy.warc.json")
             )
             is False
         )
@@ -403,7 +643,7 @@ class TestVerifyContent:
                     "date_fetched": "2024-01-01",
                     "path": "co1/privacy_policy/1",
                     "formats": {
-                        "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                        "txt": {"extension": "txt", "original_url": self.ORIGINAL_URLS}
                     },
                 },
                 {
@@ -414,7 +654,7 @@ class TestVerifyContent:
                     "formats": {
                         "html": {
                             "extension": "html",
-                            "original_url": self.ORIGINAL_URL,
+                            "original_url": self.ORIGINAL_URLS,
                         }
                     },
                 },
@@ -428,7 +668,7 @@ class TestVerifyContent:
             lambda local, gcp_path, fmt, bucket: seen_paths.append(gcp_path) or True,
         )
 
-        processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+        processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
 
         assert seen_paths == ["co1/privacy_policy/1.txt"]
 
@@ -441,7 +681,7 @@ class TestVerifyContent:
                 "date_fetched": "2024-01-01",
                 "path": "co1/privacy_policy/123",
                 "formats": {
-                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URL}
+                    "txt": {"extension": "txt", "original_url": self.ORIGINAL_URLS}
                 },
             }
         )
@@ -453,7 +693,7 @@ class TestVerifyContent:
         monkeypatch.setattr(process_module, "compare_files", boom)
 
         assert (
-            processor.verify_content("txt", self.ORIGINAL_URL, Path("dummy.txt"))
+            processor.verify_content("txt", self.ORIGINAL_URLS, Path("dummy.txt"))
             is False
         )
 
@@ -479,7 +719,7 @@ class TestReconstructMissingTxt:
 
         assert processor.formats["txt"] == {
             "extension": "txt",
-            "original_url": processor.crawlResult["url"],
+            "original_url": processor.crawlResult["urls"],
         }
         newFile = processor.sDir / f"{processor.cTimestamp}.txt"
         assert newFile.exists()
@@ -716,7 +956,7 @@ class TestProcessCrawlOrchestration:
         assert set(doc["formats"].keys()) == {"txt", "html", "pdf", "warc.json", "warc"}
         assert doc["formats"]["warc"] == {
             "extension": "wacz",
-            "original_url": processor.crawlResult["url"],
+            "original_url": processor.crawlResult["urls"],
         }
         assert len(file_names) == 5
 
@@ -739,7 +979,7 @@ class TestProcessCrawlOrchestration:
         doc = results[0]
         assert doc["formats"]["txt"] == {
             "extension": "txt",
-            "original_url": processor.crawlResult["url"],
+            "original_url": processor.crawlResult["urls"],
         }
         newTxt = processor.sDir / f"{processor.cTimestamp}.txt"
         assert newTxt in file_names

@@ -141,12 +141,19 @@ def format_data(companyData: list) -> list:
     listData = []
 
     # Iterate through the company data and make a new object for each document found
+    # doc_urls entries are keyed by display name (e.g. "Privacy Policy") and hold
+    # {"name": <display name>, "urls": [<url>, ...]} -- a doc type can list more
+    # than one url (a document split across pages), so all of them are crawled
+    # together as a single unit and merged into one captured document.
     for cObj in companyData:
         if cObj.get("doc_urls"):
-            for docType in cObj["doc_urls"]:
+            for docType, docEntry in cObj["doc_urls"].items():
+                urls = docEntry["urls"]
+                if not urls:
+                    continue
                 listData.append(
                     {
-                        "url": cObj["doc_urls"][docType],
+                        "urls": urls,
                         # Typecast the _id to a string, as sometimes it's an ObjectId
                         "objId": str(cObj["_id"]),
                         "name": cObj.get("name", "Unknown"),
@@ -155,27 +162,28 @@ def format_data(companyData: list) -> list:
                 )
 
     iCData = {}
-    # Iterate through the list of URLs to find any duplicates,
+    # Iterate through the url groups to find any duplicates,
     # Then collate the requests to prevent duplicates while preserving relevant information
     logger.info(f"Excluding Recovery Data from this run: {CFG.RECOVERY_DATA}")
     for lObj in listData:
-        if lObj["url"] in CFG.RECOVERY_DATA:
+        if any(url in CFG.RECOVERY_DATA for url in lObj["urls"]):
             # This document was already captured in a previous attempted run that did not complete
             logger.info(
-                f"Document {lObj['url']} has already been captured, skipping..."
+                f"Document {lObj['urls']} has already been captured, skipping..."
             )
             continue
-        if lObj["url"] in iCData:
-            # Found a duplicate url, so let's add the company information to the same request
+        urlKey = tuple(lObj["urls"])
+        if urlKey in iCData:
+            # Found a duplicate url group, so let's add the company information to the same request
             logger.info(
-                f"Duplicate document url {lObj['url']} found for {lObj['objId']}, collating requests..."
+                f"Duplicate document urls {lObj['urls']} found for {lObj['objId']}, collating requests..."
             )
-            iCData[lObj["url"]].append(lObj)
+            iCData[urlKey].append(lObj)
         else:
-            iCData[lObj["url"]] = [lObj]
+            iCData[urlKey] = [lObj]
 
-    # Reconstruct the data into a list of dictionaries
-    formattedListData = list(iCData.items())
+    # Reconstruct the data into a list of (urls, entries) tuples
+    formattedListData = [(list(urlKey), entries) for urlKey, entries in iCData.items()]
     # Shuffle the list of URLs to distribute them across the workers
     # Prevent any single host from getting too many simultaneous requests at once
     random.shuffle(formattedListData)

@@ -45,10 +45,22 @@ Example `company` database entry:
   "id": "platform",
   "name": "Platform",
   "doc_urls": {
-    "Terms of Service": "https://www.platform.com/terms",
-    "Privacy Policy": "http://www.platform.com/privacy",
-    "Community Guidelines": "https://platform.com/community-standards",
-    "Transparency Report": "https://platform.com/transparency"
+    "Terms of Service": {
+      "name": "Terms of Service",
+      "urls": ["https://www.platform.com/terms"]
+    },
+    "Privacy Policy": {
+      "name": "Privacy Policy",
+      "urls": ["http://www.platform.com/privacy"]
+    },
+    "Community Guidelines": {
+      "name": "Community Guidelines",
+      "urls": ["https://platform.com/community-standards"]
+    },
+    "Transparency Report": {
+      "name": "Transparency Report",
+      "urls": ["https://platform.com/transparency"]
+    }
   },
 
   # Below are Optional attributes

@@ -221,47 +221,149 @@ class TestFormatData:
 
         result = utils.format_data([sample_company])
 
-        urls = {url for url, _ in result}
-        assert urls == set(sample_company["doc_urls"].values())
-        for url, entries in result:
+        expected_groups = {
+            tuple(entry["urls"]) for entry in sample_company["doc_urls"].values()
+        }
+        groups = {tuple(urls) for urls, _ in result}
+        assert groups == expected_groups
+        for urls, entries in result:
             assert len(entries) == 1
             entry = entries[0]
+            assert entry["urls"] == urls
             assert entry["objId"] == str(sample_company["_id"])
             assert entry["name"] == sample_company["name"]
             assert entry["pType"] in {"privacy_policy", "terms_of_service"}
 
-    def test_duplicate_urls_are_collated(self, monkeypatch, sample_company):
+    def test_multiple_urls_per_doc_type_form_one_crawl_group(
+        self, monkeypatch, sample_company
+    ):
+        # A doc type listing more than one url is one logical document split
+        # across pages -- it must stay a single crawl unit, not be split into
+        # one crawl per url.
         self._no_shuffle(monkeypatch)
         CFG.RECOVERY_DATA = []
-        shared_url = "https://shared.example/policy"
+        company = {
+            **sample_company,
+            "doc_urls": {
+                "Privacy Policy": {
+                    "name": "Privacy Policy",
+                    "urls": [
+                        "https://meta.example/privacy",
+                        "https://meta.example/privacy-alt",
+                    ],
+                }
+            },
+        }
+
+        result = utils.format_data([company])
+
+        assert len(result) == 1
+        urls, entries = result[0]
+        assert urls == [
+            "https://meta.example/privacy",
+            "https://meta.example/privacy-alt",
+        ]
+        assert len(entries) == 1
+        assert entries[0]["pType"] == "privacy_policy"
+        assert entries[0]["urls"] == urls
+
+    def test_multi_url_group_preserves_given_order(self, monkeypatch, sample_company):
+        # doc_urls "urls" order reflects how the pages were intended to be
+        # read (e.g. page 2 of a policy before page 1) -- format_data must
+        # never reorder it. Deliberately not alphabetical, so a stray sort()
+        # would be caught.
+        self._no_shuffle(monkeypatch)
+        CFG.RECOVERY_DATA = []
+        ordered_urls = [
+            "https://meta.example/z-page",
+            "https://meta.example/a-page",
+            "https://meta.example/m-page",
+        ]
+        company = {
+            **sample_company,
+            "doc_urls": {
+                "Privacy Policy": {"name": "Privacy Policy", "urls": ordered_urls}
+            },
+        }
+
+        result = utils.format_data([company])
+
+        urls, entries = result[0]
+        assert urls == ordered_urls
+        assert entries[0]["urls"] == ordered_urls
+
+    def test_empty_urls_list_is_skipped(self, monkeypatch, sample_company):
+        self._no_shuffle(monkeypatch)
+        CFG.RECOVERY_DATA = []
+        company = {
+            **sample_company,
+            "doc_urls": {"Privacy Policy": {"name": "Privacy Policy", "urls": []}},
+        }
+
+        result = utils.format_data([company])
+
+        assert result == []
+
+    def test_duplicate_url_groups_are_collated(self, monkeypatch, sample_company):
+        self._no_shuffle(monkeypatch)
+        CFG.RECOVERY_DATA = []
+        shared_urls = ["https://shared.example/policy", "https://shared.example/p2"]
+        shared_doc_urls = {
+            "Privacy Policy": {"name": "Privacy Policy", "urls": shared_urls}
+        }
         company_a = {
             **sample_company,
             "_id": "a1",
-            "doc_urls": {"Privacy Policy": shared_url},
+            "doc_urls": shared_doc_urls,
         }
         company_b = {
             **sample_company,
             "_id": "b2",
             "name": "B",
-            "doc_urls": {"Privacy Policy": shared_url},
+            "doc_urls": shared_doc_urls,
         }
 
         result = utils.format_data([company_a, company_b])
 
         assert len(result) == 1
-        url, entries = result[0]
-        assert url == shared_url
+        urls, entries = result[0]
+        assert urls == shared_urls
         assert {e["objId"] for e in entries} == {"a1", "b2"}
 
     def test_recovery_data_skips_matching_urls(self, monkeypatch, sample_companies):
         self._no_shuffle(monkeypatch)
-        skipped_url = sample_companies[0]["doc_urls"]["Privacy Policy"]
+        skipped_url = sample_companies[0]["doc_urls"]["Privacy Policy"]["urls"][0]
         CFG.RECOVERY_DATA = [skipped_url]
 
         result = utils.format_data(sample_companies)
 
-        urls = {url for url, _ in result}
-        assert skipped_url not in urls
+        all_urls = {url for urls, _ in result for url in urls}
+        assert skipped_url not in all_urls
+
+    def test_recovery_data_skips_group_if_any_constituent_url_matches(
+        self, monkeypatch, sample_company
+    ):
+        self._no_shuffle(monkeypatch)
+        company = {
+            **sample_company,
+            "doc_urls": {
+                "Privacy Policy": {
+                    "name": "Privacy Policy",
+                    "urls": [
+                        "https://meta.example/privacy",
+                        "https://meta.example/privacy-alt",
+                    ],
+                }
+            },
+        }
+        # Only one of the two urls in the group was recorded as captured --
+        # the whole group should still be skipped, since it was crawled as
+        # a single unit last time.
+        CFG.RECOVERY_DATA = ["https://meta.example/privacy-alt"]
+
+        result = utils.format_data([company])
+
+        assert result == []
 
     def test_calls_shuffle(self, monkeypatch, sample_company):
         CFG.RECOVERY_DATA = []

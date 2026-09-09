@@ -72,13 +72,13 @@ class DocumentPipeline:
         # Check for a crawl failure and process the crawl result
         mongoData = []
         fileNames = []
-        crawlUrl = ""
+        crawlUrls = []
         companyObjId = ""
         success = False
         for cResult in crawlResult:
             if cResult["success"]:
                 success = True
-                crawlUrl = cResult["url"]
+                crawlUrls = cResult["urls"]
                 companyObjId = cResult["objId"]
                 mData, fNames = ProcessCrawl(
                     cResult, self.collection, self.googleBucket
@@ -88,12 +88,18 @@ class DocumentPipeline:
         # No crawls from this process succeeded, abort
         if not success:
             logger.error(
-                f"Crawl Failed for {companyData['url']}, skipping processing and not writing to recovery_log"
+                f"Crawl Failed for {', '.join(companyData['urls'])}, skipping processing and not writing to recovery_log"
             )
+            try:
+                notify_slack(
+                    f"Capture failed for {', '.join(companyData['urls'])}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send slack message: {e}")
             return None
 
         # Processing has completed, log results
-        logger.info(f"Processed {companyData['url']}")
+        logger.info(f"Processed {', '.join(companyData['urls'])}")
         logger.info(f"Crawl result: {crawlResult}")
         logger.info(f"Mongo data example: {mongoData[0] if mongoData else None}")
         logger.info(f"File name example: {fileNames[0] if fileNames else None}")
@@ -120,13 +126,13 @@ class DocumentPipeline:
                     for pData in companyData["pValues"]:
                         if pData["objId"] in new_ids:
                             notify_slack(
-                                f"New document version detected for {pData['name']}: {pData['pType']} ({companyData['url']})"
+                                f"New document version detected for {pData['name']}: {pData['pType']} ({', '.join(companyData['urls'])})"
                             )
                 except Exception as e:
                     logger.error(f"Failed to send slack message: {e}")
 
-        # Return the url to write to the recovery file
-        return crawlUrl, companyObjId
+        # Return the urls to write to the recovery file
+        return crawlUrls, companyObjId
 
     def process_all_documents(self) -> set:
         """
@@ -143,9 +149,9 @@ class DocumentPipeline:
             futureToBatch = {
                 executor.submit(
                     self.process_document,
-                    {"url": key, "pValues": value},
+                    {"urls": key, "pValues": value},
                     f"batch_{i + 1}_{int(time.time())}",
-                    # Enumerate over the companyData to create one process per url
+                    # Enumerate over the companyData to create one process per url group
                 ): i
                 for i, (key, value) in enumerate(self.companyData)
             }
@@ -158,11 +164,11 @@ class DocumentPipeline:
                     # Update the recovery file here as each thread completes
                     if result:
                         # Unpack returned tuple
-                        rUrl, rId = result
+                        rUrls, rId = result
                         results.add(rId)
                         with open(CFG.LOG_DIR / "recovery_log.txt", "a") as f:
-                            # Write the url to the file
-                            f.write(rUrl + "\n")
+                            # Write every url in the group to the file
+                            f.writelines(rUrl + "\n" for rUrl in rUrls)
                 except MemoryError as e:
                     # With the RLIMIT_AS safeguard in place (source.globals.apply_memory_safeguard),
                     # this is expected to be what an oversized document looks like instead of the

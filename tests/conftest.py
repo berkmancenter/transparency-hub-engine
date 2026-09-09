@@ -105,8 +105,14 @@ def sample_company():
         "id": "meta",
         "name": "Meta",
         "doc_urls": {
-            "Privacy Policy": "https://meta.example/privacy",
-            "Terms of Service": "https://meta.example/terms",
+            "Privacy Policy": {
+                "name": "Privacy Policy",
+                "urls": ["https://meta.example/privacy"],
+            },
+            "Terms of Service": {
+                "name": "Terms of Service",
+                "urls": ["https://meta.example/terms"],
+            },
         },
     }
 
@@ -119,7 +125,12 @@ def sample_companies(sample_company):
             "_id": "675211559efd527760c6441a",
             "id": "reddit",
             "name": "Reddit",
-            "doc_urls": {"Privacy Policy": "https://reddit.example/privacy"},
+            "doc_urls": {
+                "Privacy Policy": {
+                    "name": "Privacy Policy",
+                    "urls": ["https://reddit.example/privacy"],
+                }
+            },
         },
     ]
 

@@ -14,7 +14,7 @@ from source.crawler import BrowsertrixCrawler
 @pytest.fixture
 def p_data():
     return {
-        "url": "https://example.com/privacy",
+        "urls": ["https://example.com/privacy"],
         "pValues": [
             {"objId": "co1", "name": "Example Co", "pType": "privacy_policy"},
         ],
@@ -32,6 +32,14 @@ class TestConstructor:
         assert crawler.dockerImage == "custom:1.0"
         assert crawler.mode == "other"
 
+    def test_docker_and_jobs_clients_are_not_created_until_first_use(self):
+        # Constructing a BrowsertrixCrawler must not eagerly connect to
+        # Docker or Cloud Run -- only one of them applies depending on which
+        # environment is active, and most environments never touch either.
+        crawler = BrowsertrixCrawler()
+        assert crawler._dockerClient is None
+        assert crawler._jobsClient is None
+
 
 class TestCreateCrawlCommand:
     def test_local_mode_wraps_in_docker_run(self, monkeypatch, tmp_path):
@@ -40,7 +48,7 @@ class TestCreateCrawlCommand:
         monkeypatch.setattr("source.crawler.time.time", lambda: 1700000000)
         crawler = BrowsertrixCrawler(dockerImage="browsertrix-thub:1.2")
 
-        cmd = crawler.create_crawl_command("https://example.com", "crawl1")
+        cmd = crawler.create_crawl_command(["https://example.com"], "crawl1")
 
         assert cmd[0:2] == ["docker", "run"]
         assert "--rm" in cmd
@@ -56,11 +64,26 @@ class TestCreateCrawlCommand:
         assert "--collection" in cmd
         assert cmd[cmd.index("--collection") + 1] == "crawl1"
 
+    def test_multiple_urls_repeat_the_url_flag(self):
+        CFG.IN_LOCAL = False
+        crawler = BrowsertrixCrawler()
+
+        cmd = crawler.create_crawl_command(
+            ["https://example.com/1", "https://example.com/2"], "crawl1"
+        )
+
+        url_indices = [i for i, tok in enumerate(cmd) if tok == "--url"]
+        assert len(url_indices) == 2
+        assert [cmd[i + 1] for i in url_indices] == [
+            "https://example.com/1",
+            "https://example.com/2",
+        ]
+
     def test_non_local_mode_skips_docker_run_wrapper(self):
         CFG.IN_LOCAL = False
         crawler = BrowsertrixCrawler()
 
-        cmd = crawler.create_crawl_command("https://example.com", "crawl1")
+        cmd = crawler.create_crawl_command(["https://example.com"], "crawl1")
 
         assert cmd[0] == "crawl"
         assert "docker" not in cmd
@@ -69,7 +92,7 @@ class TestCreateCrawlCommand:
         CFG.IN_LOCAL = False
         crawler = BrowsertrixCrawler(mode="document_capture")
 
-        cmd = crawler.create_crawl_command("https://example.com", "crawl1")
+        cmd = crawler.create_crawl_command(["https://example.com"], "crawl1")
 
         assert "--generateWACZ" in cmd
         assert "--generatePDF" in cmd
@@ -79,7 +102,7 @@ class TestCreateCrawlCommand:
         CFG.IN_LOCAL = False
         crawler = BrowsertrixCrawler(mode="other")
 
-        cmd = crawler.create_crawl_command("https://example.com", "crawl1")
+        cmd = crawler.create_crawl_command(["https://example.com"], "crawl1")
 
         assert "--generateWACZ" not in cmd
         assert "--generatePDF" not in cmd
@@ -106,7 +129,7 @@ class TestRunSingleCrawlLocal:
         assert len(results) == 1
         result = results[0]
         assert result["success"] is True
-        assert result["url"] == p_data["url"]
+        assert result["urls"] == p_data["urls"]
         assert result["objId"] == "co1"
         assert result["pType"] == "privacy_policy"
         assert result["output_files"] == [str(crawl_dir / "out.wacz")]
@@ -115,7 +138,7 @@ class TestRunSingleCrawlLocal:
         CFG.IN_LOCAL = True
         CFG.CRAWL_DIR = tmp_path
         p_data = {
-            "url": "https://example.com/shared",
+            "urls": ["https://example.com/shared"],
             "pValues": [
                 {"objId": "co1", "name": "Co1", "pType": "privacy_policy"},
                 {"objId": "co2", "name": "Co2", "pType": "privacy_policy"},
@@ -229,6 +252,39 @@ class TestRunSingleCrawlDocker:
         assert results[0]["success"] is True
         assert results[0]["objId"] == "co1"
 
+    def test_docker_client_is_created_once_and_reused_across_crawls(
+        self, monkeypatch, tmp_path, p_data
+    ):
+        CFG.IN_LOCAL = False
+        CFG.IN_DOCKER = True
+        CFG.IN_CLOUD = False
+        CFG.CRAWL_DIR = tmp_path
+
+        class FakeContainer:
+            def wait(self, timeout):
+                return {"StatusCode": 0}
+
+        class FakeContainers:
+            def run(self, *a, **k):
+                return FakeContainer()
+
+        class FakeDockerClient:
+            containers = FakeContainers()
+
+        call_count = {"value": 0}
+
+        def fake_from_env():
+            call_count["value"] += 1
+            return FakeDockerClient()
+
+        monkeypatch.setattr(docker, "from_env", fake_from_env)
+        crawler = BrowsertrixCrawler()
+
+        crawler.run_single_crawl(p_data, "crawl1")
+        crawler.run_single_crawl(p_data, "crawl2")
+
+        assert call_count["value"] == 1
+
     def test_container_error_returns_clean_failure_result(
         self, monkeypatch, tmp_path, p_data
     ):
@@ -315,6 +371,41 @@ class TestRunSingleCrawlCloud:
         assert results[0]["success"] is True
         assert captured["request"].name == "projects/proj/locations/us-east4/jobs/job"
         assert captured["timeout"] == CFG.TIMEOUT
+
+    def test_jobs_client_is_created_once_and_reused_across_crawls(
+        self, monkeypatch, tmp_path, p_data
+    ):
+        CFG.IN_LOCAL = False
+        CFG.IN_DOCKER = False
+        CFG.IN_CLOUD = True
+        CFG.CRAWL_DIR = tmp_path
+        CFG.GCLOUD_PROJECT = "proj"
+        CFG.GCLOUD_REGION = "us-east4"
+        CFG.GCLOUD_JOB = "job"
+
+        from google.cloud import run_v2
+
+        class FakeOperation:
+            def result(self, timeout=None):
+                return None
+
+        class FakeJobsClient:
+            def run_job(self, request):
+                return FakeOperation()
+
+        call_count = {"value": 0}
+
+        def fake_jobs_client():
+            call_count["value"] += 1
+            return FakeJobsClient()
+
+        monkeypatch.setattr(run_v2, "JobsClient", fake_jobs_client)
+        crawler = BrowsertrixCrawler()
+
+        crawler.run_single_crawl(p_data, "crawl1")
+        crawler.run_single_crawl(p_data, "crawl2")
+
+        assert call_count["value"] == 1
 
     def test_job_execution_timeout(self, monkeypatch, tmp_path, p_data):
         # operation.result() is bounded by CFG.TIMEOUT so a stuck Cloud Run job

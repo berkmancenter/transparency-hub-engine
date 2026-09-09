@@ -5,6 +5,7 @@
 import json
 import logging
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -664,6 +665,85 @@ class TestCreateChangesJsonLocal:
 
         assert len(saved) == 1
         assert saved[0]["company_id"] == "co1"
+
+    def test_multiple_groups_are_all_processed_when_run_in_parallel(
+        self, monkeypatch, tmp_path
+    ):
+        # Regression guard for create_changes_json's ThreadPoolExecutor
+        # dispatch across (company_id, type) groups: every independent group
+        # must still get its own complete, correct output, not just the
+        # first one submitted.
+        CFG.MAX_WORKERS = 4
+        texts = {
+            "co1/privacy_policy/1.txt": "Co1 privacy version one content",
+            "co1/privacy_policy/2.txt": "Co1 privacy version two content",
+            "co2/terms_of_service/1.txt": "Co2 terms version one content",
+            "co2/terms_of_service/2.txt": "Co2 terms version two content",
+            "co3/privacy_policy/1.txt": "Co3 privacy version one content",
+            "co3/privacy_policy/2.txt": "Co3 privacy version two content",
+        }
+        documents = [
+            make_doc(
+                ObjectId(),
+                "co1/privacy_policy/1",
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                company_id="co1",
+                doc_type="privacy_policy",
+            ),
+            make_doc(
+                ObjectId(),
+                "co1/privacy_policy/2",
+                datetime(2024, 2, 1, tzinfo=timezone.utc),
+                company_id="co1",
+                doc_type="privacy_policy",
+            ),
+            make_doc(
+                ObjectId(),
+                "co2/terms_of_service/1",
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                company_id="co2",
+                doc_type="terms_of_service",
+            ),
+            make_doc(
+                ObjectId(),
+                "co2/terms_of_service/2",
+                datetime(2024, 2, 1, tzinfo=timezone.utc),
+                company_id="co2",
+                doc_type="terms_of_service",
+            ),
+            make_doc(
+                ObjectId(),
+                "co3/privacy_policy/1",
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                company_id="co3",
+                doc_type="privacy_policy",
+            ),
+            make_doc(
+                ObjectId(),
+                "co3/privacy_policy/2",
+                datetime(2024, 2, 1, tzinfo=timezone.utc),
+                company_id="co3",
+                doc_type="privacy_policy",
+            ),
+        ]
+        self._setup(monkeypatch, tmp_path, documents)
+        monkeypatch.setattr(
+            changes_module, "get_gcs_bytes", lambda path, bucket: texts[path].encode()
+        )
+        saved = []
+        save_lock = threading.Lock()
+
+        def fake_save_db(docs, path):
+            with save_lock:
+                saved.extend(docs)
+
+        monkeypatch.setattr(changes_module, "save_db", fake_save_db)
+
+        changes_module.create_changes_json()
+
+        assert sorted(d["company_id"] for d in saved) == ["co1", "co2", "co3"]
+        changes_files = list((tmp_path / "changes").rglob("*.CHANGES.json"))
+        assert len(changes_files) == 3
 
 
 # --------------------------------------------------------------------------

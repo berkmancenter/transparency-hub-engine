@@ -10,7 +10,7 @@ import shutil
 
 # Local Imports
 from .globals import CFG, logger
-from .utils import join_path, local_find
+from .utils import join_path, local_find, decode_bytes, notify_slack
 from .async_compare import (
     compare_files,
     validate_file,
@@ -20,6 +20,11 @@ from .async_compare import (
 
 if CFG.USE_MONGO:
     from pymongo.collection import Collection
+
+# Joins multiple crawled pages' .txt content into a single merged capture
+# (see ProcessCrawl.merge_txt_files) -- a blank line between pages keeps them
+# visually distinguishable without any structural markup.
+TXT_PAGE_SEPARATOR = "\n\n"
 
 
 class ProcessCrawl:
@@ -82,6 +87,11 @@ class ProcessCrawl:
           tuple (list, list): A list of dictionaries formated for the Document collection and a list of filenames to upload to the storage bucket
         """
 
+        # Alert on any page that came back 404 (directly, or via a redirect that
+        # ultimately landed on one) before anything else -- this must run even
+        # when the txt-unchanged short-circuit below skips the rest of processing
+        self.check_for_failed_captures()
+
         # List of tuples that include the file format ending and the local file directory
         formatDir = [
             ("txt", self.aDir),
@@ -99,7 +109,7 @@ class ProcessCrawl:
 
         if self.txtDirectlyChanged is False:
             logger.info(
-                f"No change in directly-captured .txt for {self.crawlResult['url']}, "
+                f"No change in directly-captured .txt for {', '.join(self.crawlResult['urls'])}, "
                 "skipping remaining formats"
             )
         else:
@@ -149,6 +159,12 @@ class ProcessCrawl:
                     json.dump(
                         self.create_warc_json(pagesJsonFile, extraPagesJsonFile), f
                     )
+            elif iFormat == "txt":
+                # A crawl can visit more than one page (multiple seed urls in this
+                # document's group, or additional in-scope pages) -- merge every
+                # .txt file into one before it goes through the shared new/changed
+                # check below, rather than only using one page's text
+                cTypeFile = self.merge_txt_files(iDir)
             else:
                 cTypeFile = list(iDir.glob(f"*.{iFormat}"))
                 if cTypeFile:
@@ -158,17 +174,19 @@ class ProcessCrawl:
 
             # WACZ files are refered to by their unzipped name, WARC, in the format field of the Document collection
             mongoFormat = "warc" if iFormat == "wacz" else iFormat
-            originalUrl = self.crawlResult["url"]
+            # Stored verbatim (order preserved, never sorted) as formats[mongoFormat]["original_url"]
+            # below -- it must stay in the same order as the doc_urls entry's "urls" list
+            originalUrls = self.crawlResult["urls"]
 
             # Verify the file has changes, bypass for wacz file
             if (
                 iFormat == "wacz"
                 or self.confirmedNew
-                or self.verify_content(mongoFormat, originalUrl, cTypeFile)
+                or self.verify_content(mongoFormat, originalUrls, cTypeFile)
             ):
                 # Confirmed that this is a new capture
                 logger.info(
-                    f"Found new {iFormat} file for {originalUrl}, will add capture data to database..."
+                    f"Found new {iFormat} file for {', '.join(originalUrls)}, will add capture data to database..."
                 )
 
                 # Copy the file into sDir and add capture info to return lists
@@ -176,7 +194,7 @@ class ProcessCrawl:
                 shutil.copy(cTypeFile, newFilePath)
                 self.formats[mongoFormat] = {
                     "extension": iFormat,
-                    "original_url": originalUrl,
+                    "original_url": originalUrls,
                 }
                 self.fileNames.append(newFilePath)
 
@@ -184,16 +202,60 @@ class ProcessCrawl:
                     # Set confirmed_new since the .txt should be an accurate indicator across all other existing formats
                     self.confirmedNew = True
             else:
-                logger.info(f"No new {iFormat} file for {originalUrl}")
+                logger.info(f"No new {iFormat} file for {', '.join(originalUrls)}")
                 self.failCounter += 1
                 if iFormat == "txt":
                     self.txtDirectlyChanged = False
         except Exception as e:
             # Continue to try to find other formats
             logger.error(
-                f"Failed to find/copy {iFormat} file for {self.crawlResult['url']}: {e}"
+                f"Failed to find/copy {iFormat} file for {', '.join(self.crawlResult['urls'])}: {e}"
             )
             self.failCounter += 1
+
+    def merge_txt_files(self, iDir: Path) -> Path:
+        """
+        Merges every .txt file the crawl produced under iDir into a single file.
+
+        A crawl can visit more than one page (multiple seed urls in this
+        document's group, or additional in-scope pages found during the crawl),
+        and Browsertrix's --detachedText writes one file per page. There's no
+        reliable way to map an individual page file back to the specific seed
+        url that produced it, so pages are merged in file-modification-time
+        order -- the closest available proxy for crawl/visit order -- rather
+        than filename order, which has no relationship to visit order at all.
+        This is a best-effort approximation of "same order the pages were
+        crawled in", NOT a guarantee that content order matches the doc_urls
+        entry's "urls" order the way the formats[...]["original_url"] list
+        does (see process_format).
+
+        The merged file is written into self.sDir (unique per company/pType
+        being processed), not iDir. iDir is re-globbed by every pValue
+        collated onto this same crawl (process_document builds one
+        ProcessCrawl per pValue, all sharing the same crawl_name -> the same
+        iDir) -- writing the merge output there would let a later pValue's
+        merge re-glob and re-ingest an earlier pValue's already-merged file
+        as if it were just another page, compounding its content.
+
+        Args:
+          iDir (Path): The archive directory to search for captured .txt files
+
+        Returns:
+          Path: The path to the merged .txt file, written under self.sDir
+        """
+        txtFiles = sorted(iDir.glob("*.txt"), key=lambda p: p.stat().st_mtime)
+        if not txtFiles:
+            raise Exception("No txt file created during capture")
+
+        texts = []
+        for txtFile in txtFiles:
+            with open(txtFile, "rb") as f:
+                texts.append(decode_bytes(f.read()))
+
+        mergedPath = join_path(self.sDir, f"{self.cTimestamp}.merged.txt")
+        with open(mergedPath, "w", encoding="utf-8") as f:
+            f.write(TXT_PAGE_SEPARATOR.join(texts))
+        return mergedPath
 
     def reconstruct_missing_txt(self):
         """
@@ -206,7 +268,7 @@ class ProcessCrawl:
         yields text passing the same validation and change-detection checks
         a directly captured .txt would go through.
         """
-        originalUrl = self.crawlResult["url"]
+        originalUrls = self.crawlResult["urls"]
 
         for rFormat in RECONSTRUCTION_FORMAT_PRIORITY:
             if rFormat not in self.formats:
@@ -218,11 +280,11 @@ class ProcessCrawl:
                 with open(sourcePath, "rb") as f:
                     rawBytes = f.read()
                 text = reconstruct_text_from_format(
-                    rawBytes, rFormat, extension, originalUrl
+                    rawBytes, rFormat, extension, originalUrls
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to reconstruct .txt from {rFormat} for {originalUrl}: {e}"
+                    f"Failed to reconstruct .txt from {rFormat} for {', '.join(originalUrls)}: {e}"
                 )
                 continue
 
@@ -240,19 +302,22 @@ class ProcessCrawl:
                 # error) just rules out this candidate format instead of
                 # propagating out of process_crawl and losing every other
                 # format already validated for this document.
-                verified = self.verify_content("txt", originalUrl, newFilePath)
+                verified = self.verify_content("txt", originalUrls, newFilePath)
             except Exception as e:
                 logger.error(
                     f"verify_content failed for .txt reconstructed from {rFormat} "
-                    f"for {originalUrl}: {e}"
+                    f"for {', '.join(originalUrls)}: {e}"
                 )
                 verified = False
 
             if verified:
                 logger.info(
-                    f"Reconstructed .txt capture for {originalUrl} from {rFormat}"
+                    f"Reconstructed .txt capture for {', '.join(originalUrls)} from {rFormat}"
                 )
-                self.formats["txt"] = {"extension": "txt", "original_url": originalUrl}
+                self.formats["txt"] = {
+                    "extension": "txt",
+                    "original_url": originalUrls,
+                }
                 self.fileNames.append(newFilePath)
                 return
 
@@ -262,8 +327,43 @@ class ProcessCrawl:
             os.remove(newFilePath)
 
         logger.info(
-            f"Could not reconstruct a .txt capture for {originalUrl} from any available format"
+            f"Could not reconstruct a .txt capture for {', '.join(originalUrls)} from any available format"
         )
+
+    def check_for_failed_captures(self):
+        """
+        Scans this crawl's pages.jsonl/extraPages.jsonl for any page whose
+        final HTTP status is 404 -- this covers both a direct 404 and a
+        redirect chain that ultimately lands on one, since Browsertrix
+        records the resolved status after following redirects, not the
+        status of the first hop. Sends a Slack alert listing the affected
+        urls; no-ops (via notify_slack) if Slack isn't configured.
+        """
+        failedUrls = set()
+        for jsonFile in (self.jDir / "pages.jsonl", self.jDir / "extraPages.jsonl"):
+            if not jsonFile.exists():
+                continue
+            with open(jsonFile, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        page = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if page.get("url") and str(page.get("status")) == "404":
+                        failedUrls.add(page["url"])
+
+        if failedUrls:
+            name = self.crawlResult.get("name", self.crawlResult["objId"])
+            try:
+                notify_slack(
+                    f"404 error capturing {name} ({self.crawlResult['pType']}): "
+                    f"{', '.join(sorted(failedUrls))}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send slack message: {e}")
 
     def create_warc_json(self, pagesFile: Path, extraPagesFile: Path):
         """
@@ -335,14 +435,16 @@ class ProcessCrawl:
         }
         return warcJson
 
-    def verify_content(self, mongoFormat: str, originalUrl: str, cPath: Path) -> bool:
+    def verify_content(
+        self, mongoFormat: str, originalUrls: list[str], cPath: Path
+    ) -> bool:
         """
         A wrapper function for compare.py that checks to see if a prior version of this document can be located in the existing document store, and then analyzes them for changes
         It also validates the file to ensure it matches the expectations of a successful captured document
 
         Args:
           mongoFormat (str): The format key as stored under a document's "formats" dict (e.g. "warc" for wacz files)
-          originalUrl (str): The source URL this capture was fetched from, used for logging
+          originalUrls (list[str]): The source URLs this capture was fetched from, used for logging
           cPath (Path): A Path to the local file containing the new capture in the specified format
 
         Returns:
@@ -352,7 +454,7 @@ class ProcessCrawl:
         # Do a simple quality check on the capture
         if not validate_file(cPath, mongoFormat):
             logger.info(
-                f"Failed to validate content for {originalUrl}, rejecting capture"
+                f"Failed to validate content for {', '.join(originalUrls)}, rejecting capture"
             )
             return False
 
@@ -380,7 +482,7 @@ class ProcessCrawl:
         if bestMatch is None:
             # No previous capture was found, save this capture
             logger.info(
-                f"No previous capture found for {originalUrl}, okay to push to Mongo and GCP..."
+                f"No previous capture found for {', '.join(originalUrls)}, okay to push to Mongo and GCP..."
             )
             return True
         else:
@@ -392,7 +494,7 @@ class ProcessCrawl:
             except Exception as e:
                 # If comparison fails, do not push the new capture, and log failure
                 logger.error(
-                    f"Compare funcion failed for {mongoFormat} file for {originalUrl}: {e}"
+                    f"Compare funcion failed for {mongoFormat} file for {', '.join(originalUrls)}: {e}"
                 )
                 logger.error(
                     "This file will not be saved to the document store or database"

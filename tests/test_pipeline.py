@@ -37,7 +37,7 @@ class FakeCrawler:
 
     def run_single_crawl(self, p_data, batch_id):
         self.calls.append((p_data, batch_id))
-        return self.results_by_url.get(p_data["url"], self.default)
+        return self.results_by_url.get(tuple(p_data["urls"]), self.default)
 
 
 class FakeProcessCrawl:
@@ -128,17 +128,47 @@ class TestInit:
 class TestProcessDocument:
     def test_no_successful_crawl_returns_none(self):
         crawler = FakeCrawler(
-            default=[{"success": False, "url": "https://x", "pValues": []}]
+            default=[{"success": False, "urls": ["https://x"], "pValues": []}]
         )
         pipeline = make_pipeline(crawler=crawler)
-        company_data = {"url": "https://x", "pValues": []}
+        company_data = {"urls": ["https://x"], "pValues": []}
 
+        assert pipeline.process_document(company_data, "batch_1") is None
+
+    def test_no_successful_crawl_notifies_slack(self, monkeypatch):
+        crawler = FakeCrawler(
+            default=[{"success": False, "urls": ["https://x"], "pValues": []}]
+        )
+        pipeline = make_pipeline(crawler=crawler)
+        messages = []
+        monkeypatch.setattr(
+            pipeline_module, "notify_slack", lambda msg: messages.append(msg)
+        )
+        company_data = {"urls": ["https://x"], "pValues": []}
+
+        pipeline.process_document(company_data, "batch_1")
+
+        assert messages == ["Capture failed for https://x"]
+
+    def test_slack_failure_on_crawl_failure_is_caught(self, monkeypatch):
+        crawler = FakeCrawler(
+            default=[{"success": False, "urls": ["https://x"], "pValues": []}]
+        )
+        pipeline = make_pipeline(crawler=crawler)
+
+        def boom(msg):
+            raise RuntimeError("slack is down")
+
+        monkeypatch.setattr(pipeline_module, "notify_slack", boom)
+        company_data = {"urls": ["https://x"], "pValues": []}
+
+        # Must not raise
         assert pipeline.process_document(company_data, "batch_1") is None
 
     def test_successful_crawl_returns_url_and_company_id(self, monkeypatch):
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -147,19 +177,19 @@ class TestProcessDocument:
         CFG.DRY_RUN = True
         monkeypatch.setattr(pipeline_module, "ProcessCrawl", FakeProcessCrawl)
         company_data = {
-            "url": "https://x",
+            "urls": ["https://x"],
             "pValues": [{"objId": "co1", "name": "X", "pType": "privacy_policy"}],
         }
 
         result = pipeline.process_document(company_data, "batch_1")
 
-        assert result == ("https://x", "co1")
+        assert result == (["https://x"], "co1")
 
     def test_dry_run_skips_all_side_effects(self, monkeypatch):
         CFG.DRY_RUN = True
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -193,7 +223,7 @@ class TestProcessDocument:
         )
 
         company_data = {
-            "url": "https://x",
+            "urls": ["https://x"],
             "pValues": [{"objId": "co1", "name": "X", "pType": "privacy_policy"}],
         }
         pipeline.process_document(company_data, "batch_1")
@@ -206,7 +236,7 @@ class TestProcessDocument:
         CFG.IN_CLOUD = False
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -235,7 +265,7 @@ class TestProcessDocument:
         )
 
         company_data = {
-            "url": "https://x",
+            "urls": ["https://x"],
             "pValues": [{"objId": "co1", "name": "X", "pType": "privacy_policy"}],
         }
         pipeline.process_document(company_data, "batch_1")
@@ -253,7 +283,7 @@ class TestProcessDocument:
         CFG.DOCUMENTS_BSON = Path("db/documents.bson")
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -269,7 +299,7 @@ class TestProcessDocument:
         )
         monkeypatch.setattr(pipeline_module, "upload_to_GCP", lambda *a, **k: None)
 
-        company_data = {"url": "https://x", "pValues": []}
+        company_data = {"urls": ["https://x"], "pValues": []}
         pipeline.process_document(company_data, "batch_1")
 
         assert captured["path"] == CFG.DOCUMENTS_BSON
@@ -280,7 +310,7 @@ class TestProcessDocument:
         CFG.IN_CLOUD = True
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -294,7 +324,7 @@ class TestProcessDocument:
             pipeline_module, "upload_to_GCP", lambda *a, **k: called.update(value=True)
         )
 
-        company_data = {"url": "https://x", "pValues": []}
+        company_data = {"urls": ["https://x"], "pValues": []}
         pipeline.process_document(company_data, "batch_1")
 
         assert called["value"] is False
@@ -305,7 +335,7 @@ class TestProcessDocument:
         CFG.IN_CLOUD = True
         crawl_result = {
             "success": True,
-            "url": "https://x",
+            "urls": ["https://x"],
             "objId": "co1",
             "pType": "privacy_policy",
         }
@@ -324,7 +354,7 @@ class TestProcessDocument:
         )
 
         company_data = {
-            "url": "https://x",
+            "urls": ["https://x"],
             "pValues": [
                 {"objId": "co1", "name": "Co1", "pType": "privacy_policy"},
                 {"objId": "co2", "name": "Co2", "pType": "terms"},
@@ -348,13 +378,13 @@ class TestProcessAllDocuments:
         CFG.IN_CLOUD = False
         pipeline = make_pipeline(collection=[])
         pipeline.companyData = [
-            ("https://a", [{"objId": "co-a"}]),
-            ("https://b", [{"objId": "co-b"}]),
+            (["https://a"], [{"objId": "co-a"}]),
+            (["https://b"], [{"objId": "co-b"}]),
         ]
 
         def fake_process_document(companyData, batch_id):
-            if companyData["url"] == "https://a":
-                return ("https://a", "co-a")
+            if companyData["urls"] == ["https://a"]:
+                return (["https://a"], "co-a")
             return None
 
         pipeline.process_document = fake_process_document
@@ -364,19 +394,40 @@ class TestProcessAllDocuments:
         assert results == {"co-a"}
         assert (tmp_path / "recovery_log.txt").read_text() == "https://a\n"
 
+    def test_writes_every_url_in_a_multi_url_group_to_recovery_log(self, tmp_path):
+        # A url group with more than one url is written as one recovery-log
+        # line per url, so a restart's format_data (which skips a group if
+        # any constituent url is found) recognizes the whole group as done.
+        CFG.LOG_DIR = tmp_path
+        CFG.IN_CLOUD = False
+        pipeline = make_pipeline(collection=[])
+        pipeline.companyData = [
+            (["https://a", "https://a-alt"], [{"objId": "co-a"}]),
+        ]
+        pipeline.process_document = lambda companyData, batch_id: (
+            companyData["urls"],
+            "co-a",
+        )
+
+        pipeline.process_all_documents()
+
+        assert (
+            tmp_path / "recovery_log.txt"
+        ).read_text() == "https://a\nhttps://a-alt\n"
+
     def test_exception_in_one_future_does_not_abort_others(self, tmp_path, caplog):
         CFG.LOG_DIR = tmp_path
         CFG.IN_CLOUD = False
         pipeline = make_pipeline(collection=[])
         pipeline.companyData = [
-            ("https://a", [{"objId": "co-a"}]),
-            ("https://b", [{"objId": "co-b"}]),
+            (["https://a"], [{"objId": "co-a"}]),
+            (["https://b"], [{"objId": "co-b"}]),
         ]
 
         def fake_process_document(companyData, batch_id):
-            if companyData["url"] == "https://a":
+            if companyData["urls"] == ["https://a"]:
                 raise RuntimeError("boom")
-            return ("https://b", "co-b")
+            return (["https://b"], "co-b")
 
         pipeline.process_document = fake_process_document
 
