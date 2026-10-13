@@ -22,7 +22,7 @@ from typing import Optional
 
 # Local Imports
 from source.globals import CFG, logger
-from source.utils import get_gcs_bytes, decode_bytes
+from source.utils import get_gcs_bytes, decode_bytes, normalize_seed_url
 
 
 # Caps the input handed to rapidfuzz's C++ implementation. rapidfuzz raises a raw
@@ -403,13 +403,24 @@ def extract_text_from_warc_json_bytes(
     targetUrls = [url for url in targetUrls if url]
 
     if targetUrls:
-        matched = [
-            record.get("content", "")
-            for record in records
-            if any(url in record.get("urls", []) for url in targetUrls)
-        ]
-        if matched:
-            return "\n\n".join(matched)
+        # records are in the order the crawler finished pages, which varies
+        # from run to run -- order the matches by seed url instead, the same
+        # order merge_txt_files uses, so the text is stable across captures
+        seedIndex = {}
+        for i, url in enumerate(targetUrls):
+            seedIndex.setdefault(normalize_seed_url(url), i)
+        ranked = []
+        for record in records:
+            ranks = [
+                seedIndex[normalize_seed_url(url)]
+                for url in record.get("urls", [])
+                if normalize_seed_url(url) in seedIndex
+            ]
+            if ranks:
+                ranked.append((min(ranks), record.get("content", "")))
+        if ranked:
+            ranked.sort(key=lambda r: r[0])
+            return "\n\n".join(content for _, content in ranked)
 
     return "\n\n".join(record.get("content", "") for record in records)
 

@@ -37,6 +37,16 @@ def join_path(path, *paths) -> Path:
     return Path(os.path.normpath(os.path.join(path, *paths)))
 
 
+def normalize_seed_url(url: str) -> str:
+    """
+    Normalizes a url just enough to match a crawled page's recorded url back
+    to the doc_urls seed it came from (fragment and trailing slash dropped,
+    since the crawler may record either form). Query strings are kept, since
+    they can select genuinely different content.
+    """
+    return url.split("#", 1)[0].rstrip("/")
+
+
 def mongo_connect():
     """
     Connects to a MongoDB database.

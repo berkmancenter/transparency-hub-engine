@@ -38,6 +38,15 @@ def _write_with_mtime(path: Path, content: str, mtime_offset: int) -> None:
     os.utime(path, (stamp, stamp))
 
 
+def _write_pages_jsonl(j_dir: Path, pages: list[tuple[str, str]]) -> None:
+    """Writes a pages.jsonl mapping each (url, text) the way the crawl's
+    --text to-pages output does, so merge_txt_files can map detached .txt
+    pages back to their seed urls."""
+    (j_dir / "pages.jsonl").write_text(
+        "\n".join(json.dumps({"url": url, "text": text}) for url, text in pages)
+    )
+
+
 @pytest.fixture
 def crawl_dirs(cfg_dirs):
     crawl_result = make_crawl_result()
@@ -182,7 +191,9 @@ class TestCheckForFailedCaptures:
         assert "https://a.example/missing" in messages[0]
         assert "404" in messages[0]
 
-    def test_collects_404s_from_both_page_files(self, processor, crawl_dirs, monkeypatch):
+    def test_collects_404s_from_both_page_files(
+        self, processor, crawl_dirs, monkeypatch
+    ):
         _, _, _, j_dir = crawl_dirs
         (j_dir / "pages.jsonl").write_text(
             json.dumps({"url": "https://a.example/1", "status": 200})
@@ -290,18 +301,24 @@ class TestProcessFormat:
         assert copied.exists()
         assert processor.fileNames == [copied]
 
-    def test_txt_merges_multiple_pages_in_mtime_order(
-        self, processor, crawl_dirs, monkeypatch
+    def test_txt_merges_multiple_pages_in_seed_url_order(
+        self, crawl_dirs, fake_collection, monkeypatch
     ):
-        # A crawl with more than one seed url (or extra in-scope pages)
-        # produces one .txt per page -- all of them must be merged into the
-        # captured document instead of arbitrarily keeping just one.
-        # Filenames are deliberately in the opposite order of their mtimes,
-        # so this only passes if merge order actually follows mtime rather
-        # than filename.
-        _, _c_dir, a_dir, _j_dir = crawl_dirs
-        _write_with_mtime(a_dir / "z_page.txt", "first page text", 100)
-        _write_with_mtime(a_dir / "a_page.txt", "second page text", 200)
+        # A crawl with more than one seed url produces one .txt per page --
+        # all of them must be merged into the captured document, in the
+        # doc_urls entry's url order. The mtimes deliberately contradict
+        # that order (the second seed finished loading first), so this only
+        # passes if merge order follows the seed urls, not load timing.
+        _, _c_dir, a_dir, j_dir = crawl_dirs
+        urls = ["https://example.com/one", "https://example.com/two"]
+        _write_with_mtime(a_dir / "a_page.txt", "second page text", 100)
+        _write_with_mtime(a_dir / "z_page.txt", "first page text", 200)
+        _write_pages_jsonl(
+            j_dir, [(urls[1], "second page text"), (urls[0], "first page text")]
+        )
+        processor = ProcessCrawl(
+            make_crawl_result(urls=urls), fake_collection, googleBucket=None
+        )
         monkeypatch.setattr(processor, "verify_content", lambda fmt, url, path: True)
 
         processor.process_format(("txt", a_dir))
@@ -395,21 +412,102 @@ class TestProcessFormat:
 
 
 class TestMergeTxtFiles:
-    def test_merges_in_mtime_order_and_writes_under_sDir(self, processor, crawl_dirs):
-        # Written under self.sDir (unique per company/pType), NOT iDir --
-        # iDir gets re-globbed by every pValue collated onto this crawl, so
-        # writing the merge output there would let a later pValue's merge
-        # re-ingest an earlier pValue's already-merged file. Filenames are
-        # deliberately reversed relative to mtime, so this only passes if
-        # merge order actually follows mtime.
-        _, _c_dir, a_dir, _j_dir = crawl_dirs
-        _write_with_mtime(a_dir / "b_page.txt", "first", 100)
-        _write_with_mtime(a_dir / "a_page.txt", "second", 200)
+    def test_merges_in_seed_url_order_and_writes_under_cDir(
+        self, crawl_dirs, fake_collection
+    ):
+        # Written under self.cDir (this crawl's own scratch dir), NOT
+        # self.sDir (the persistent captures dir -- process_format only
+        # copies it there once verify_content confirms a real change, so
+        # writing it there directly would leave a stray file behind on
+        # every rejected/unchanged capture too) and NOT iDir (iDir gets
+        # re-globbed by every pValue collated onto this crawl, so writing
+        # the merge output there would let a later pValue's merge re-ingest
+        # an earlier pValue's already-merged file). Filenames and mtimes are
+        # both deliberately reversed relative to the seed urls, so this only
+        # passes if merge order actually follows the seed urls.
+        _, c_dir, a_dir, j_dir = crawl_dirs
+        urls = ["https://example.com/one", "https://example.com/two"]
+        _write_with_mtime(a_dir / "a_page.txt", "second", 100)
+        _write_with_mtime(a_dir / "b_page.txt", "first", 200)
+        _write_pages_jsonl(j_dir, [(urls[1], "second"), (urls[0], "first")])
+        processor = ProcessCrawl(
+            make_crawl_result(urls=urls), fake_collection, googleBucket=None
+        )
 
         mergedPath = processor.merge_txt_files(a_dir)
 
-        assert mergedPath == processor.sDir / f"{processor.cTimestamp}.merged.txt"
+        assert mergedPath == c_dir / f"{processor.cTimestamp}.merged.txt"
         assert mergedPath.read_text() == "first\n\nsecond"
+
+    def test_same_pages_merge_identically_regardless_of_load_order(
+        self, crawl_dirs, fake_collection
+    ):
+        # Regression guard for the false "new version" captures: two crawls
+        # of identical pages that finished loading in a different order
+        # (different mtimes and pages.jsonl order) must merge to the exact
+        # same text, so change detection never sees a reorder as a change.
+        _, _c_dir, a_dir, j_dir = crawl_dirs
+        urls = [
+            "https://example.com/one",
+            "https://example.com/two",
+            "https://example.com/three",
+        ]
+        texts = ["page one", "page two", "page three"]
+        processor = ProcessCrawl(
+            make_crawl_result(urls=urls), fake_collection, googleBucket=None
+        )
+
+        merged = []
+        for loadOrder in ([0, 1, 2], [2, 0, 1]):
+            for f in a_dir.glob("*.txt"):
+                f.unlink()
+            for offset, i in enumerate(loadOrder):
+                _write_with_mtime(a_dir / f"page_{i}.txt", texts[i], offset)
+            _write_pages_jsonl(j_dir, [(urls[i], texts[i]) for i in loadOrder])
+            merged.append(processor.merge_txt_files(a_dir).read_text())
+
+        assert merged[0] == merged[1] == "page one\n\npage two\n\npage three"
+
+    def test_matches_seed_url_despite_trailing_slash_or_fragment(
+        self, crawl_dirs, fake_collection
+    ):
+        _, _c_dir, a_dir, j_dir = crawl_dirs
+        urls = ["https://example.com/one", "https://example.com/two/"]
+        (a_dir / "a.txt").write_text("second")
+        (a_dir / "b.txt").write_text("first")
+        _write_pages_jsonl(
+            j_dir,
+            [
+                ("https://example.com/two", "second"),
+                ("https://example.com/one#x", "first"),
+            ],
+        )
+        processor = ProcessCrawl(
+            make_crawl_result(urls=urls), fake_collection, googleBucket=None
+        )
+
+        assert processor.merge_txt_files(a_dir).read_text() == "first\n\nsecond"
+
+    def test_unmatched_pages_go_last_in_deterministic_text_order(
+        self, crawl_dirs, fake_collection
+    ):
+        # Pages that can't be mapped to a seed url (no pages.jsonl entry)
+        # follow every matched page, ordered by their own text -- never by
+        # mtime or filename.
+        _, _c_dir, a_dir, j_dir = crawl_dirs
+        urls = ["https://example.com/one"]
+        _write_with_mtime(a_dir / "a.txt", "zebra", 100)
+        _write_with_mtime(a_dir / "b.txt", "apple", 200)
+        _write_with_mtime(a_dir / "c.txt", "seed page", 300)
+        _write_pages_jsonl(j_dir, [(urls[0], "seed page")])
+        processor = ProcessCrawl(
+            make_crawl_result(urls=urls), fake_collection, googleBucket=None
+        )
+
+        assert (
+            processor.merge_txt_files(a_dir).read_text()
+            == "seed page\n\napple\n\nzebra"
+        )
 
     def test_does_not_write_into_the_globbed_directory(self, processor, crawl_dirs):
         # Regression guard for the cross-pValue corruption bug: a second call

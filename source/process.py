@@ -10,7 +10,13 @@ import shutil
 
 # Local Imports
 from .globals import CFG, logger
-from .utils import join_path, local_find, decode_bytes, notify_slack
+from .utils import (
+    join_path,
+    local_find,
+    decode_bytes,
+    notify_slack,
+    normalize_seed_url,
+)
 from .async_compare import (
     compare_files,
     validate_file,
@@ -219,31 +225,50 @@ class ProcessCrawl:
 
         A crawl can visit more than one page (multiple seed urls in this
         document's group, or additional in-scope pages found during the crawl),
-        and Browsertrix's --detachedText writes one file per page. There's no
-        reliable way to map an individual page file back to the specific seed
-        url that produced it, so pages are merged in file-modification-time
-        order -- the closest available proxy for crawl/visit order -- rather
-        than filename order, which has no relationship to visit order at all.
-        This is a best-effort approximation of "same order the pages were
-        crawled in", NOT a guarantee that content order matches the doc_urls
-        entry's "urls" order the way the formats[...]["original_url"] list
-        does (see process_format).
+        and Browsertrix's --detachedText writes one file per page. Pages are
+        merged in the same order as the doc_urls entry's "urls" list (the same
+        order formats[...]["original_url"] stores, see process_format): each
+        page file's text is matched back to its url via pages.jsonl /
+        extraPages.jsonl (see seed_rank_by_text), whose "text" field holds the
+        exact same page text the detached file does.
 
-        The merged file is written into self.sDir (unique per company/pType
-        being processed), not iDir. iDir is re-globbed by every pValue
-        collated onto this same crawl (process_document builds one
-        ProcessCrawl per pValue, all sharing the same crawl_name -> the same
-        iDir) -- writing the merge output there would let a later pValue's
-        merge re-glob and re-ingest an earlier pValue's already-merged file
-        as if it were just another page, compounding its content.
+        The order MUST be stable from one capture to the next. The merged text
+        is compared with fuzz.ratio, which is order-sensitive, so two captures
+        with identical pages in a different order can score well below
+        FUZZY_THRESHOLD and get archived as a "new version" even though nothing
+        changed. An earlier version of this ordered pages by file mtime, which
+        reflects whichever page finished loading first. That changed from run
+        to run and produced near-daily false "new version" captures for
+        multi-url documents. Any page that can't be matched to a seed url goes
+        after every matched page, ordered by its own text, so it is still
+        deterministic and never depends on load timing.
+
+        The merged file is written into self.cDir (this crawl's own scratch
+        directory), NOT self.sDir (the persistent captures directory) and
+        NOT iDir. Not self.sDir: process_format only copies cTypeFile into
+        self.sDir once verify_content confirms this is actually a new/changed
+        capture (see process_format) -- writing the merge output directly
+        into self.sDir here would leave a stray "<timestamp>.merged.txt"
+        behind permanently even when the capture turns out unchanged and
+        gets rejected, and -- since self.sDir IS the GCS FUSE-mounted bucket
+        path when CFG.IN_CLOUD -- means silently leaking junk files into
+        production GCS on rejected captures, not just to local disk. Not
+        iDir: iDir is re-globbed by every pValue collated onto this same
+        crawl (process_document builds one ProcessCrawl per pValue, all
+        sharing the same crawl_name -> the same iDir) -- writing the merge
+        output there would let a later pValue's merge re-glob and re-ingest
+        an earlier pValue's already-merged file as if it were just another
+        page, compounding its content. self.cDir is scanned by neither: the
+        only other formatDir entry that globs self.cDir directly is
+        ("wacz", self.cDir), which only matches "*.wacz".
 
         Args:
           iDir (Path): The archive directory to search for captured .txt files
 
         Returns:
-          Path: The path to the merged .txt file, written under self.sDir
+          Path: The path to the merged .txt file, written under self.cDir
         """
-        txtFiles = sorted(iDir.glob("*.txt"), key=lambda p: p.stat().st_mtime)
+        txtFiles = list(iDir.glob("*.txt"))
         if not txtFiles:
             raise Exception("No txt file created during capture")
 
@@ -252,10 +277,51 @@ class ProcessCrawl:
             with open(txtFile, "rb") as f:
                 texts.append(decode_bytes(f.read()))
 
-        mergedPath = join_path(self.sDir, f"{self.cTimestamp}.merged.txt")
+        seedRanks = self.seed_rank_by_text()
+        unmatchedRank = len(self.crawlResult["urls"])
+        texts.sort(key=lambda t: (seedRanks.get(t.strip(), unmatchedRank), t))
+
+        mergedPath = join_path(self.cDir, f"{self.cTimestamp}.merged.txt")
         with open(mergedPath, "w", encoding="utf-8") as f:
             f.write(TXT_PAGE_SEPARATOR.join(texts))
         return mergedPath
+
+    def seed_rank_by_text(self) -> dict[str, int]:
+        """
+        Maps each crawled page's (stripped) text to the index of the seed url
+        it came from in this crawl's "urls" list, using pages.jsonl /
+        extraPages.jsonl (the crawl records each page's url alongside its
+        text). Used by merge_txt_files to put detached .txt pages back in
+        doc_urls order. Pages whose url isn't one of the seeds are left out.
+
+        Returns:
+          dict[str, int]: Stripped page text -> lowest matching seed index
+        """
+        seedIndex = {}
+        for i, url in enumerate(self.crawlResult["urls"]):
+            seedIndex.setdefault(normalize_seed_url(url), i)
+
+        ranks = {}
+        for jsonFile in (self.jDir / "pages.jsonl", self.jDir / "extraPages.jsonl"):
+            if not jsonFile.exists():
+                continue
+            with open(jsonFile, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        page = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not page.get("url") or not page.get("text"):
+                        continue
+                    rank = seedIndex.get(normalize_seed_url(page["url"]))
+                    if rank is None:
+                        continue
+                    key = page["text"].strip()
+                    ranks[key] = min(rank, ranks.get(key, rank))
+        return ranks
 
     def reconstruct_missing_txt(self):
         """

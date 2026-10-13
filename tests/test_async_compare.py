@@ -580,6 +580,28 @@ class TestReconstructTextFromFormat:
 
         assert text == "page one\n\npage two"
 
+    def test_warc_json_multi_url_records_join_in_seed_url_order(self):
+        # Records arrive in whatever order the crawler finished pages, which
+        # varies run to run -- the joined text must follow the seed url list
+        # instead, or identical captures diff as changed.
+        raw = json.dumps(
+            {
+                "records": [
+                    {"urls": ["https://a.example/2/"], "content": "page two"},
+                    {"urls": ["https://a.example/1"], "content": "page one"},
+                ]
+            }
+        ).encode()
+
+        text = ac.reconstruct_text_from_format(
+            raw,
+            "warc.json",
+            "warc.json",
+            originalUrl=["https://a.example/1", "https://a.example/2"],
+        )
+
+        assert text == "page one\n\npage two"
+
     def test_warc_json_falls_back_to_joining_all_records_when_no_url_in_list_matches(
         self,
     ):
