@@ -176,12 +176,10 @@ class TestGetValidatedCompanies:
     def test_sync_priority_filters_below_threshold_and_absent_entries(
         self, monkeypatch, sample_companies
     ):
-        """When SYNC_PRIORITY > 1, any company *not* present in
-        PRIORITY_DICT is also excluded (the `.get(...) and ...` check is
-        falsy for a missing key) -- not just companies with an explicit low
-        priority. This contradicts the config.yaml comment that absent
-        companies default to monthly (priority 1) captures; that guarantee
-        only holds when SYNC_PRIORITY == 1."""
+        """With the default DEFAULT_PRIORITY of 1, a company *not* present
+        in PRIORITY_DICT counts as priority 1, so it's excluded whenever
+        SYNC_PRIORITY > 1 -- not just companies with an explicit low
+        priority."""
         monkeypatch.setattr(utils, "get_all_companies", lambda: sample_companies)
         CFG.USE_LOCAL_COMPANIES = False
         CFG.SYNC_PRIORITY = 3
@@ -204,6 +202,40 @@ class TestGetValidatedCompanies:
         result = utils.get_validated_companies()
 
         assert result == sample_companies
+
+
+class TestCaptureTiers:
+    """Daily (3) / weekly (2, the default) / monthly (1) capture tiers, as
+    configured in production: DEFAULT_PRIORITY 2, fringe companies listed at
+    priority 1 in PRIORITY_DICT."""
+
+    @pytest.fixture
+    def tiered(self, monkeypatch):
+        companies = [
+            {"_id": cid, "id": cid, "name": cid, "doc_urls": {}}
+            for cid in ("daily", "weekly", "monthly", "disabled")
+        ]
+        monkeypatch.setattr(utils, "get_all_companies", lambda: companies)
+        CFG.USE_LOCAL_COMPANIES = False
+        CFG.DEFAULT_PRIORITY = 2
+        CFG.PRIORITY_DICT = {"daily": 3, "monthly": 1, "disabled": 0}
+
+    def _run(self, sync_priority, sync_priority_max=0):
+        CFG.SYNC_PRIORITY = sync_priority
+        CFG.SYNC_PRIORITY_MAX = sync_priority_max
+        return [c["_id"] for c in utils.get_validated_companies()]
+
+    def test_daily_run_only_captures_daily_tier(self, tiered):
+        assert self._run(3) == ["daily"]
+
+    def test_weekly_run_captures_default_tier_but_not_monthly(self, tiered):
+        assert self._run(2) == ["daily", "weekly"]
+
+    def test_monthly_run_captures_only_the_monthly_tier(self, tiered):
+        assert self._run(1, sync_priority_max=1) == ["monthly"]
+
+    def test_full_run_captures_everything_but_disabled(self, tiered):
+        assert self._run(1) == ["daily", "weekly", "monthly"]
 
 
 # --------------------------------------------------------------------------

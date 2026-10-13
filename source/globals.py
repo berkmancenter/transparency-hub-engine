@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 # Load environment variables from .env
@@ -51,6 +52,10 @@ class AppConfig:
     COMPANIES_JSON: Path = Path("db/companies.json")
     # Configuration Settings
     SYNC_PRIORITY: int = 1
+    # Upper bound on the priorities a run captures; 0 = no upper bound
+    SYNC_PRIORITY_MAX: int = 0
+    # Priority for companies without a PRIORITY_DICT entry
+    DEFAULT_PRIORITY: int = 1
     FUZZY_THRESHOLD: int = 97
     MAX_WORKERS: int = 2
     TIMEOUT: int = 1200
@@ -118,7 +123,9 @@ def apply_memory_safeguard():
     try:
         import resource  # type: ignore
     except ImportError:
-        logger.info("Skipping memory safeguard: RLIMIT_AS is not available on this platform")
+        logger.info(
+            "Skipping memory safeguard: RLIMIT_AS is not available on this platform"
+        )
         return
 
     limit_bytes = int(CFG.MEMORY_LIMIT_MB * 1024 * 1024 * CFG.MEMORY_SOFT_LIMIT_RATIO)
@@ -236,6 +243,13 @@ def init_globals():
     )
 
     parser.add_argument(
+        "--sync_priority_max",
+        type=int,
+        default=int(os.getenv("SYNC_PRIORITY_MAX", 0)),
+        help="Highest priority to sync (default: 0, no upper bound). E.g. --sync_priority 1 --sync_priority_max 1 syncs only the priority-1 (monthly) tier",
+    )
+
+    parser.add_argument(
         "--config",
         type=str,
         default=os.getenv("CONFIG_PATH", "config.yaml"),
@@ -257,6 +271,7 @@ def init_globals():
     CFG.GCLOUD_REGION = args.gcloud_region
     CFG.GCLOUD_JOB = args.gcloud_job
     CFG.SYNC_PRIORITY = args.sync_priority
+    CFG.SYNC_PRIORITY_MAX = args.sync_priority_max
     # Not a global variable, only relevant for this module
     CONFIG_FILE = args.config
 
@@ -281,7 +296,8 @@ def init_globals():
             topic: [re.compile(p, re.IGNORECASE) for p in patterns]
             for topic, patterns in config.get("TOPIC_PATTERNS", {}).items()
         }
-        CFG.PRIORITY_DICT = config.get("PRIORITY_DICT", {})
+        CFG.PRIORITY_DICT = config.get("PRIORITY_DICT") or {}
+        CFG.DEFAULT_PRIORITY = config.get("DEFAULT_PRIORITY", 1)
         CFG.USE_POLICY_CLASSIFIER = config.get("USE_POLICY_CLASSIFIER", True)
         CFG.POLICY_CLASSIFIER_THRESHOLD = config.get("POLICY_CLASSIFIER_THRESHOLD", 0.3)
         CFG.USE_DIFF_TRIMMER = config.get("USE_DIFF_TRIMMER", False)
@@ -360,6 +376,8 @@ def init_globals():
           GCLOUD_REGION = {CFG.GCLOUD_REGION}
           GCLOUD_JOB = {CFG.GCLOUD_JOB}
           SYNC_PRIORITY = {CFG.SYNC_PRIORITY}
+          SYNC_PRIORITY_MAX = {CFG.SYNC_PRIORITY_MAX or "none"}
+          DEFAULT_PRIORITY = {CFG.DEFAULT_PRIORITY}
           CONFIG_FILE = {CONFIG_FILE}
           USE_LOCAL_COMPANIES = {CFG.USE_LOCAL_COMPANIES}
           {"COMPANIES_JSON = " + str(CFG.COMPANIES_JSON) if CFG.USE_LOCAL_COMPANIES or not CFG.USE_MONGO else "None"}
@@ -373,7 +391,7 @@ def init_globals():
           USE_DIFF_TRIMMER = {CFG.USE_DIFF_TRIMMER}
           {"DIFF_TRIMMER_THRESHOLD = " + str(CFG.DIFF_TRIMMER_THRESHOLD) if CFG.USE_DIFF_TRIMMER else "None"}
           {"Topic Patterns are set in the config file" if CFG.TOPIC_PATTERNS != {} else "Topic Patterns are not set in the config file"}
-          {"Priority Dictionary is set in the config file: " + str(CFG.PRIORITY_DICT) if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
+          {"Priority Dictionary is set in the config file: " + str(dict(Counter(CFG.PRIORITY_DICT.values()))) + " (priority: company count)" if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
           
           """
     logger.info(options_string)

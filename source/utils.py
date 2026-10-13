@@ -116,24 +116,22 @@ def get_validated_companies() -> list:
         return pData
     # Then, check if there is a priority list
     logger.info("Applying priority filtering, see config file for details")
-    if CFG.PRIORITY_DICT != {}:
-        # Then exclude any companies with a priority of 0
-        pExclude = [
+    if CFG.PRIORITY_DICT != {} or CFG.DEFAULT_PRIORITY != 1:
+        # A company's priority is its PRIORITY_DICT entry, or DEFAULT_PRIORITY
+        # when it has none. Priority 0 is never captured; otherwise a run
+        # captures every company with SYNC_PRIORITY <= priority, capped at
+        # SYNC_PRIORITY_MAX when that's set (e.g. a monthly run that only
+        # captures the priority-1 tier). See config.yaml's PRIORITY_DICT.
+        def priority(p: dict) -> int:
+            return CFG.PRIORITY_DICT.get(str(p["_id"]), CFG.DEFAULT_PRIORITY)
+
+        pData = [
             p
             for p in pData
-            if CFG.PRIORITY_DICT.get(str(p["_id"])) is not None
-            and CFG.PRIORITY_DICT[str(p["_id"])] == 0
+            if priority(p) != 0
+            and priority(p) >= CFG.SYNC_PRIORITY
+            and (not CFG.SYNC_PRIORITY_MAX or priority(p) <= CFG.SYNC_PRIORITY_MAX)
         ]
-        pData = [p for p in pData if p not in pExclude]
-        # If SYNC_PRIORITY is 1, we're all set, otherwise run one more filter
-        if CFG.SYNC_PRIORITY > 1:
-            # Then exclude any companies with a priority less than SYNC_PRIORITY
-            pData = [
-                p
-                for p in pData
-                if CFG.PRIORITY_DICT.get(str(p["_id"]))
-                and CFG.PRIORITY_DICT[str(p["_id"])] >= CFG.SYNC_PRIORITY
-            ]
 
     return pData
 

@@ -18,7 +18,7 @@ FUZZY_RATIO: 94
 
 # Number of workers to utilize while running the capture process, scale based on available resources
 # Defaults to 4
-MAX_WORKERS: 4
+MAX_WORKERS: 8
 
 # Maximum time each capture can take, in seconds
 # Decreasing this value may help if the capture process is taking too long, but may reduce the number of policies captured
@@ -106,23 +106,33 @@ MEMORY_LIMIT_MB: 16384
 MEMORY_SOFT_LIMIT_RATIO: 0.85
 
 # Prioritization of the selected companies to establish frequency of captures
-# The higher the value, the more frequently the capture will be made
-# The lower the value, the less frequently the capture will be made
-# The default value is 1, which means the capture will be attempted once per month
-# The value can be set to 0 to disable captures for a company
-# Note that these are intended for use in Google Cloud Run with a scheduler, which is required to set up the regularity of captures
-# 
+# Each Cloud Scheduler trigger runs the job with a SYNC_PRIORITY (and optionally
+# SYNC_PRIORITY_MAX); a run captures every company whose priority falls in
+# [SYNC_PRIORITY, SYNC_PRIORITY_MAX] (no upper bound when SYNC_PRIORITY_MAX is unset):
+#
+# - Daily   (Mon-Thu, pipeline-daily-mon-thurs):  SYNC_PRIORITY=3                      -> priority 3
+# - Weekly  (Fri,     pipeline-weekly-friday):     SYNC_PRIORITY=2                      -> priority 2 and 3
+# - Monthly (1st,     pipeline-monthly):           SYNC_PRIORITY=1, SYNC_PRIORITY_MAX=1 -> priority 1 only
+#
 # VALUES:
 # - 0: Disable capture for a company
-# - 1: Attempt capture once per month
-# - 2: Attempt capture once per week
-# - 3: Attempt capture once per day
+# - 1: Capture once per month (fringe / low-usage platforms)
+# - 2: Capture once per week (the default -- see DEFAULT_PRIORITY)
+# - 3: Capture once per day
 # - 4: Use 4 or higher when adding new companies to the database to run only on those companies
-# 
+#
 # The company_id must match the _id field in the Mongo Companies database or in the input JSON file
-# If a company is not in this dictionary, it will be attempted to be captured once per month (Equivalent to 1)
+# A company that isn't in this dictionary gets DEFAULT_PRIORITY
 # It will ignore unknown company_ids
-# Defaults to an empty dictionary, which means captures will only be ran at SYNC_PRIORITY = 1
+#
+# The priority-1 (monthly) entries below were generated on 2026-10-13: companies
+# marked Inactive, plus companies whose website isn't in the Tranco top-1M list
+# (tranco-list.eu, list 64VKX) and that have no Wikipedia article -- roughly the
+# least-used ~28% of the dataset. Move a company between tiers by editing its entry.
+
+# Priority for companies without a PRIORITY_DICT entry (defaults to 1)
+DEFAULT_PRIORITY: 2
+
 PRIORITY_DICT:
   # Keys are MongoDB ObjectIDs from the companies collection (_id field).
   # To find an ID: open MongoDB Compass and look up the company, or run: db.companies.find({name: "Platform"})
@@ -138,6 +148,149 @@ PRIORITY_DICT:
   "675211559efd527760c64417": 3 # Snapchat
   "6840b087a96cab74c26a3260" : 3 # Discord
   "675211559efd527760c64418" : 3 # TikTok
+
+  # Monthly tier (priority 1)
+  "6840b084a96cab74c26a320c" : 1 # Achat Pro
+  "6840b084a96cab74c26a3218" : 1 # AHA Live Video Chat
+  "6840b084a96cab74c26a321c" : 1 # Amino (Inactive)
+  "68544d58978e42ce21fe1a05" : 1 # Animated 3D Emoji Stickers
+  "6840b087a96cab74c26a3276" : 1 # AutoSender Pro
+  "68544a3953c40294de273643" : 1 # BESTY (Inactive)
+  "6840b087a96cab74c26a3240" : 1 # BirthdaysPro HD
+  "684340244d9c4a4324f5b28a" : 1 # Bluetooth Messenger
+  "6840b084a96cab74c26a31f5" : 1 # Blush
+  "684c938f67bd9598d5b634bc" : 1 # Bridgefy
+  "6840b084a96cab74c26a31e6" : 1 # buz
+  "6840b087a96cab74c26a3272" : 1 # California Roping
+  "6840b087a96cab74c26a3232" : 1 # CapGenius
+  "6772ca874b443c7c16d5b233" : 1 # Cato
+  "6840b087a96cab74c26a3280" : 1 # Chroncord
+  "68544d58978e42ce21fe1a03" : 1 # CLIPish
+  "68544a3953c40294de27364b" : 1 # Clockout
+  "6840b087a96cab74c26a323c" : 1 # Colors For Twitter
+  "6840b087a96cab74c26a325f" : 1 # ContactsPro HX
+  "6840b087a96cab74c26a3285" : 1 # Control Panel for Twitter
+  "6840b087a96cab74c26a3239" : 1 # Cute Emoticon Keyboard
+  "6840b087a96cab74c26a324a" : 1 # Darling (Inactive)
+  "6840b087a96cab74c26a3267" : 1 # DefaultSMS
+  "6840b084a96cab74c26a320a" : 1 # DirectChat
+  "684340244d9c4a4324f5b287" : 1 # DUBS (Inactive)
+  "6840b087a96cab74c26a327a" : 1 # Emoji for Message Pro
+  "684340244d9c4a4324f5b28c" : 1 # Enneagram Premium
+  "69e0ff896e732293bfd02041" : 1 # Euki
+  "6840b082a96cab74c26a31d3" : 1 # EVA AI Chat Bot & Soulmate
+  "6840b087a96cab74c26a3246" : 1 # Facemakr
+  "68544a3953c40294de273641" : 1 # Fake Status
+  "684340244d9c4a4324f5b288" : 1 # Fav Talk
+  "6ace8f3378fd156925286c26" : 1 # Fizz
+  "6840b084a96cab74c26a31df" : 1 # Flip (Inactive)
+  "6840b087a96cab74c26a329b" : 1 # Flirtini
+  "6840b087a96cab74c26a324b" : 1 # Followers & Unfollow Tracker.
+  "6840b084a96cab74c26a31ec" : 1 # Free Tone
+  "684c938f67bd9598d5b634b7" : 1 # Friendcord
+  "68544a3953c40294de27363f" : 1 # Gay Bear Chat
+  "6840b087a96cab74c26a3264" : 1 # Gay Older Men Chat
+  "6840b082a96cab74c26a31c2" : 1 # Genesia AI
+  "6840b087a96cab74c26a326b" : 1 # Gibberish Writer
+  "6840b087a96cab74c26a3266" : 1 # GR8 (Inactive)
+  "6840b087a96cab74c26a3262" : 1 # Greeting Cards App
+  "6840b087a96cab74c26a322b" : 1 # Griddy Pro
+  "6840b087a96cab74c26a3227" : 1 # Handwritten email
+  "6840b084a96cab74c26a31e4" : 1 # HolMe Dating app
+  "6840b087a96cab74c26a3249" : 1 # Hunch Dating App
+  "684c938f67bd9598d5b634bb" : 1 # ICEBlock
+  "6840b087a96cab74c26a323f" : 1 # IM Map Navigator
+  "6840b087a96cab74c26a3245" : 1 # IM+ Messenger
+  "684c938f67bd9598d5b634b5" : 1 # Img Picker Web Extension
+  "6840b087a96cab74c26a3230" : 1 # Instant Save+
+  "6840b087a96cab74c26a3271" : 1 # iQuassel
+  "684c938767bd9598d5b634b0" : 1 # JoyVid
+  "68544a3953c40294de27363a" : 1 # KeepCalling International
+  "684340244d9c4a4324f5b283" : 1 # Laserhouse
+  "68544a3953c40294de273649" : 1 # LayOver S.N.
+  "6840b087a96cab74c26a3278" : 1 # LimeChat
+  "6840b084a96cab74c26a3200" : 1 # Linky
+  "6840b087a96cab74c26a3296" : 1 # Litstick
+  "684c938767bd9598d5b634af" : 1 # LitUp
+  "6840b084a96cab74c26a31f0" : 1 # Local Single
+  "68544a3153c40294de273635" : 1 # Lumi
+  "68544d58978e42ce21fe1a04" : 1 # Mast (Inactive)
+  "6840b084a96cab74c26a320d" : 1 # MICO
+  "6840b082a96cab74c26a31c7" : 1 # Mimico
+  "6840b084a96cab74c26a31ed" : 1 # Mind Warriors Hub
+  "690cfa939c574b3cc9220a13" : 1 # Neon
+  "684c938f67bd9598d5b634b4" : 1 # Nothing
+  "6840b087a96cab74c26a3295" : 1 # Online Dating & Hot Video Chat
+  "6840b087a96cab74c26a3273" : 1 # Palaver IRC
+  "6840b084a96cab74c26a320e" : 1 # Paradot
+  "6840b087a96cab74c26a3236" : 1 # Pictures Collage
+  "68544d5e978e42ce21fe1a0f" : 1 # Pingly
+  "68544a3953c40294de27363e" : 1 # Pixelix
+  "684340244d9c4a4324f5b28b" : 1 # PixWatch for Google Photos
+  "6840b084a96cab74c26a31f8" : 1 # Plamfy
+  "6840b087a96cab74c26a325d" : 1 # PNK (Inactive)
+  "68544efa3a6978981fe94afa" : 1 # Private Safe Texting Message
+  "6840b087a96cab74c26a3270" : 1 # Puerto Bikers (Inactive)
+  "6840b084a96cab74c26a3222" : 1 # purp
+  "684c938f67bd9598d5b634b9" : 1 # Purrrr
+  "69e100d46e732293bfd02044" : 1 # QRing
+  "684c938f67bd9598d5b634ba" : 1 # Random Video Chat With People
+  "6840b087a96cab74c26a3263" : 1 # Red Flags
+  "6840b087a96cab74c26a32a5" : 1 # Reports Followers
+  "6840b087a96cab74c26a329c" : 1 # Reports+/FamedMobile Market
+  "6840b087a96cab74c26a3290" : 1 # Reports+/GopGop Apps
+  "6ace8f3378fd156925286c34" : 1 # Retro
+  "6840b087a96cab74c26a329d" : 1 # sendit
+  "6840b087a96cab74c26a3235" : 1 # SessionTalk
+  "6840b087a96cab74c26a3233" : 1 # SkyText
+  "6840b084a96cab74c26a31f3" : 1 # Slootopia
+  "6840b087a96cab74c26a328a" : 1 # SocialFocus
+  "69537d3e65453d8415146100" : 1 # Sora (Inactive)
+  "684c938767bd9598d5b634ad" : 1 # SparkV
+  "6840b087a96cab74c26a3265" : 1 # Speech to Text (Inactive)
+  "6840b087a96cab74c26a3284" : 1 # SpeedLight Viewer
+  "68544a3953c40294de273646" : 1 # Spool for Safari
+  "6840b087a96cab74c26a327e" : 1 # Spring for Twitter
+  "6840b087a96cab74c26a3231" : 1 # Spy Messenger
+  "6840b084a96cab74c26a31e9" : 1 # StarLive Lite
+  "6840b087a96cab74c26a322e" : 1 # Story Reposter
+  "6840b087a96cab74c26a325e" : 1 # Story Saver
+  "6840b087a96cab74c26a3279" : 1 # Str8 & Bi
+  "684c938f67bd9598d5b634b2" : 1 # StrobeLoco
+  "68544a3953c40294de273645" : 1 # Subset Network
+  "6840b084a96cab74c26a31fd" : 1 # SuperLive
+  "6772ca874b443c7c16d5b234" : 1 # Supernova
+  "6840b087a96cab74c26a326c" : 1 # SweetRing
+  "6840b087a96cab74c26a3269" : 1 # Symbol Pad Pro
+  "6840b087a96cab74c26a3252" : 1 # TalkU
+  "6840b082a96cab74c26a31cb" : 1 # TanTan
+  "6840b087a96cab74c26a326a" : 1 # Taylor Time (Inactive)
+  "6840b084a96cab74c26a31de" : 1 # Text Me
+  "6840b087a96cab74c26a324d" : 1 # Tik Saver Pro
+  "6840b087a96cab74c26a3250" : 1 # Topics
+  "6840b087a96cab74c26a3241" : 1 # Tumbletail
+  "6840b087a96cab74c26a3294" : 1 # Upward
+  "6772ca874b443c7c16d5b23b" : 1 # Vanatu
+  "6840b087a96cab74c26a327d" : 1 # VideoSound
+  "6840b084a96cab74c26a31e7" : 1 # Vone
+  "6840b084a96cab74c26a31f9" : 1 # VoVoo Lite
+  "68544d58978e42ce21fe1a06" : 1 # Walkie Talkie
+  "6840b087a96cab74c26a3242" : 1 # WalkieTalkie VOIP
+  "68544d58978e42ce21fe1a07" : 1 # Watch Chat 2
+  "6840b087a96cab74c26a3255" : 1 # WatchsApp
+  "6840b084a96cab74c26a3219" : 1 # Waveful
+  "68545819e7bafa14c8e435a0" : 1 # WeePhone SIP
+  "6840b087a96cab74c26a3281" : 1 # WeTalk Pro
+  "6840b084a96cab74c26a31ee" : 1 # Wizz App
+  "6840b087a96cab74c26a3254" : 1 # WooPlus
+  "6840b087a96cab74c26a3287" : 1 # World of WIT
+  "6840b087a96cab74c26a3282" : 1 # WristChat for Facebook (Inactive)
+  "6840b087a96cab74c26a326d" : 1 # WtfAgain for Web Messenger
+  "6772ca874b443c7c16d5b244" : 1 # Yareny (Inactive)
+  "68544a3953c40294de273648" : 1 # YNK (Inactive)
+  "68544a3953c40294de27363d" : 1 # YT Shorts Blocker
+  "6840b084a96cab74c26a31f2" : 1 # Zanex
+  "6840b087a96cab74c26a326e" : 1 # Zing Txt
 
 
 # This dictionary manages the detection of topics for the .CHANGES.json files
