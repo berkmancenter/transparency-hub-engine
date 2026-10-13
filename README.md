@@ -214,6 +214,8 @@ Accepts a mongo connection string.  See MongoDB documentation for more details.
 `--sync_priority` the priority level to run the sync at, highly configurable using the PRIORITY_DICT in the config.  When set to 1, will run on all companies not disabled in the config. (default: 1)
 Accepts any positive integer, though generally should be between 1-4 depending on your configuration setup.
 
+`--sync_priority_max` the highest priority level to run the sync at; 0 means no upper bound. Combined with `--sync_priority`, a run captures every company whose priority (its PRIORITY_DICT entry, or `DEFAULT_PRIORITY` in the config) falls in that range -- e.g. `--sync_priority 1 --sync_priority_max 1` captures only the priority-1 (monthly) tier. (default: 0)
+
 `--config` the Path to the configuration file. (default: config.yaml)
 Accepts any valid Path.
 
@@ -242,6 +244,8 @@ CAPTURES_DIR should be set as the direct mount path of the Storage Bucket. (Reco
 CONFIG_PATH should be set wherever you store the config file within your Storage Bucket.  This must be uploaded manually as part of setup. (Recommended: /mnt/runtime/config.yaml)
 
 SYNC_PRIORITY can be set to whatever positive integer is appropriate. (Recommended: 1)
+
+Capture frequency is tiered with Cloud Scheduler triggers that override SYNC_PRIORITY (and SYNC_PRIORITY_MAX) per run, against the config's PRIORITY_DICT and DEFAULT_PRIORITY: a daily trigger at SYNC_PRIORITY=3 (major platforms), a weekly trigger at SYNC_PRIORITY=2 (everything except the monthly tier -- DEFAULT_PRIORITY is 2), and a monthly trigger at SYNC_PRIORITY=1 with SYNC_PRIORITY_MAX=1 (only the least-used companies, listed at priority 1). See the PRIORITY_DICT comments in `config.yaml`.
 
 GCP_BUCKET is the name of the mounted Storage Bucket.
 
