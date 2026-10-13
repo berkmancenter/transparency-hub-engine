@@ -8,7 +8,6 @@
 import zipfile
 import gzip
 import io
-import os
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString
 import PyPDF2
@@ -535,18 +534,29 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
     return True
 
 
-# compare_files/validate_file are each called synchronously from a worker
-# thread that's already part of pipeline.py's own ThreadPoolExecutor -- this
-# executor exists purely to bound a single blocking call with a timeout, not
-# to add concurrency (there was never any actual concurrent work happening
-# inside the old asyncio event loop these replaced, just one awaited task).
-# Sized like asyncio's own default executor (min(32, cpu_count + 4)) so it
-# offers the same concurrency headroom, but created once at import time
-# instead of a fresh event loop + default executor on every single call.
-_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=min(32, (os.cpu_count() or 1) + 4),
-    thread_name_prefix="compare-timeout",
-)
+# compare_files/validate_file each run their sync counterpart in a fresh,
+# single-use worker thread rather than a shared pool. An earlier version of
+# this code (briefly) used one shared, bounded ThreadPoolExecutor for every
+# call -- but future.result(timeout=...) only stops WAITING on a timeout, it
+# can't cancel the underlying thread, so a genuinely stuck call (e.g. a hung
+# GCS FUSE read inside get_gcs_bytes, source/utils.py) keeps occupying one of
+# the shared pool's limited worker slots for as long as ITS OWN internal
+# timeout takes to fire. Enough concurrent hangs could exhaust every shared
+# slot, making every OTHER in-flight comparison/validation queue behind them
+# and time out too, even though its own file was perfectly fine. A fresh
+# executor per call (matching get_gcs_bytes' own pattern) keeps a stuck call
+# isolated to its own abandoned thread, exactly like the old per-call asyncio
+# event loop this replaced.
+def _run_with_timeout(func, args: tuple, timeout: float, timeout_message: str):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(func, *args)
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        logger.warning(timeout_message)
+        return False
+    finally:
+        executor.shutdown(wait=False)
 
 
 def compare_files(
@@ -562,16 +572,12 @@ def compare_files(
       bucket (str): Name of the GCP bucket (None if running in Google Cloud)
       timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    future = _TIMEOUT_EXECUTOR.submit(
-        _compare_files_sync, localPath, gcpPath, format, bucket
+    return _run_with_timeout(
+        _compare_files_sync,
+        (localPath, gcpPath, format, bucket),
+        timeout,
+        f"Comparison timed out after {timeout}s for {localPath} ({format})",
     )
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        logger.warning(
-            f"Comparison timed out after {timeout}s for {localPath} ({format})"
-        )
-        return False
 
 
 def validate_file(localPath, format, timeout=300.0):
@@ -583,11 +589,9 @@ def validate_file(localPath, format, timeout=300.0):
       format (str): Format of the file
       timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    future = _TIMEOUT_EXECUTOR.submit(_validate_file_sync, localPath, format)
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        logger.warning(
-            f"Validation timed out after {timeout}s for {localPath} ({format})"
-        )
-        return False
+    return _run_with_timeout(
+        _validate_file_sync,
+        (localPath, format),
+        timeout,
+        f"Validation timed out after {timeout}s for {localPath} ({format})",
+    )

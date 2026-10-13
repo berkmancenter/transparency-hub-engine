@@ -41,13 +41,13 @@ def _fetch_and_decode_with_retries(
             return text
         except TimeoutError as e:
             logger.error(f"Attempt {attempt} failed fetching {path}: {e}")
-    logger.error(f"Giving up on {path} after {retries + 1} attempts, skipping this pair")
+    logger.error(
+        f"Giving up on {path} after {retries + 1} attempts, skipping this pair"
+    )
     return None
 
 
-def _fetch_html_trimmed(
-    capture: dict, bucket, html_cache: DocumentCache
-) -> str | None:
+def _fetch_html_trimmed(capture: dict, bucket, html_cache: DocumentCache) -> str | None:
     """
     Fetches a capture's html format (if it has one) and trims header/footer/
     nav boilerplate off it via source/boundary_classifier.py, purely so the
@@ -85,7 +85,9 @@ def _fetch_html_trimmed(
         html_cache.put(path, trimmed)
         return trimmed
     except Exception as e:
-        logger.warning(f"Diff trimmer failed for {capture['path']}, using untrimmed text instead: {e}")
+        logger.warning(
+            f"Diff trimmer failed for {capture['path']}, using untrimmed text instead: {e}"
+        )
         return None
 
 
@@ -658,7 +660,9 @@ def _process_change_group(
             version_info = f"{olderTimestamp}-{newerTimestamp}"
 
             # Create .CHANGES.json file path
-            changesFilePath = f"{CFG.CHANGES_DIR}/{companyId}/{docType}/{version_info}.CHANGES.json"
+            changesFilePath = (
+                f"{CFG.CHANGES_DIR}/{companyId}/{docType}/{version_info}.CHANGES.json"
+            )
 
             # Create .CHANGES.json file
             change_data = {

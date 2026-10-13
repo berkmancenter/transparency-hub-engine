@@ -14,6 +14,7 @@ import shutil
 import json
 import time
 import random
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import urllib.request
@@ -158,8 +159,18 @@ def format_data(companyData: list) -> list:
     for cObj in companyData:
         if cObj.get("doc_urls"):
             for docType, docEntry in cObj["doc_urls"].items():
-                urls = docEntry["urls"]
+                # docEntry is expected to be {"name": ..., "urls": [...]}, but
+                # get_validated_companies only checks that "doc_urls" exists on
+                # the company, not the shape of each entry -- a malformed or
+                # still-old-schema (bare string) entry shouldn't be able to
+                # crash format_data() for every OTHER company in the same run.
+                urls = docEntry.get("urls") if isinstance(docEntry, dict) else None
                 if not urls:
+                    if docEntry:
+                        logger.warning(
+                            f"Skipping malformed doc_urls entry for {cObj.get('name', cObj.get('_id'))} "
+                            f"({docType}): expected {{'urls': [...]}}, got {docEntry!r}"
+                        )
                     continue
                 listData.append(
                     {
@@ -341,6 +352,14 @@ class DocumentCache:
         return len(self._cache)
 
 
+# Guards the local-mode (CFG.USE_MONGO=False) bson file append below.
+# source/changes.py's create_changes_json now processes (company_id, type)
+# groups concurrently via a ThreadPoolExecutor, and each group calls save_db
+# independently -- without this lock, two threads' "open(..., 'ab')" +
+# write() calls could interleave and corrupt the shared local database file.
+_save_db_lock = threading.Lock()
+
+
 def save_db(db: list[dict], dbPath: Path):
     """
     Saves a dictionary object into a local bson database file with MongoDB compatible ObjectIds
@@ -351,14 +370,15 @@ def save_db(db: list[dict], dbPath: Path):
 
     """
     logger.info(f"Writing new documents to {dbPath}")
-    with open(dbPath, "ab") as f:
-        for dbItem in db:
-            # Make sure all items have an ObjectId
-            if dbItem.get("_id") is None:
-                new_oid = ObjectId()
-                dbItem["_id"] = new_oid
-            # Save each item to the bson file
-            f.write(bson.encode(dbItem))
+    with _save_db_lock:
+        with open(dbPath, "ab") as f:
+            for dbItem in db:
+                # Make sure all items have an ObjectId
+                if dbItem.get("_id") is None:
+                    new_oid = ObjectId()
+                    dbItem["_id"] = new_oid
+                # Save each item to the bson file
+                f.write(bson.encode(dbItem))
     logger.info(f"Completed write to {dbPath}")
 
 
