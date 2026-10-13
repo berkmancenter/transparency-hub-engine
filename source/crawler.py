@@ -102,8 +102,6 @@ class BrowsertrixCrawler:
             "105",
             "--postLoadDelay",
             "8",
-            "--pageExtraDelay",
-            "8",
         ]
 
         # With plans to add more modes, this will need to be expanded, but for now document_capture is the only valid mode
@@ -117,12 +115,13 @@ class BrowsertrixCrawler:
                 "fullPage",
                 "--text",
                 "to-pages",
-                "--depth",
-                "1",
+                # Capture only the seed urls themselves (the doc_urls entry's
+                # pages), never links discovered on them. Following in-scope
+                # links (previously --depth 1 --scopeType prefix --pageLimit
+                # 20) never fed the merged .txt -- only seed pages get
+                # detached text -- but roughly doubled crawl time.
                 "--scopeType",
-                "prefix",
-                "--pageLimit",
-                "20",
+                "page",
                 # This will exclude links with query parameters, and reduce time and size
                 # Some query parameters are irrelevant, haven't found an efficient way to exclude them
                 # Hasn't been working as expected in testing

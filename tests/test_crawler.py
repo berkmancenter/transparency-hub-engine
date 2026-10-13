@@ -98,6 +98,19 @@ class TestCreateCrawlCommand:
         assert "--generatePDF" in cmd
         assert "--detachedText" in cmd
 
+    def test_crawls_only_seed_pages_without_extra_delay(self):
+        # Following in-scope links (--depth/--pageLimit with prefix scope)
+        # and the per-page --pageExtraDelay roughly doubled weekly crawl
+        # time without contributing to the merged .txt capture.
+        CFG.IN_LOCAL = False
+        crawler = BrowsertrixCrawler(mode="document_capture")
+
+        cmd = crawler.create_crawl_command(["https://example.com"], "crawl1")
+
+        assert cmd[cmd.index("--scopeType") + 1] == "page"
+        for flag in ("--depth", "--pageLimit", "--pageExtraDelay"):
+            assert flag not in cmd
+
     def test_other_mode_skips_document_capture_flags(self):
         CFG.IN_LOCAL = False
         crawler = BrowsertrixCrawler(mode="other")
