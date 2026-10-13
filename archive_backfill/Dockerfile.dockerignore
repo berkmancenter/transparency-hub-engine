@@ -1,0 +1,30 @@
+# Per-Dockerfile ignore file (BuildKit feature: <dockerfile-path>.dockerignore
+# in the build context, matched instead of the top-level .dockerignore when
+# building with `-f archive_backfill/Dockerfile`). Keeps this job's build
+# context scoped to just what it COPYs, without touching or being affected
+# by the root .dockerignore that governs the live pipeline's own image.
+#
+# Same allowlist approach as the root .dockerignore: ignore everything by
+# default, then explicitly un-ignore what archive_backfill/Dockerfile COPYs.
+*
+
+!archive_backfill
+!archive_backfill/**
+!source
+!source/**
+!models
+!models/**
+
+# Rules below apply AFTER the negations above (last-match-wins), so they
+# re-exclude anything under archive_backfill/** that shouldn't ride along
+# just because the directory as a whole is allowlisted -- most importantly
+# a real .env (Cloud Run gets its secrets via --set-secrets/--set-env-vars,
+# never a baked-in file), plus compiled bytecode and this job's own data/
+# scratch output.
+archive_backfill/.env
+archive_backfill/.env.*
+!archive_backfill/.env.local
+archive_backfill/data
+archive_backfill/logs
+**/__pycache__
+**/*.pyc

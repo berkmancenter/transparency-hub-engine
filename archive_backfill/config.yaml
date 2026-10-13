@@ -1,0 +1,75 @@
+# Wayback Machine Historical Backfill - job configuration
+# Loaded by archive_backfill/settings.py. Secrets (MONGODB_URL, GCP_BUCKET,
+# SLACK_WEBHOOK_URL, ...) are NOT here -- they come from environment
+# variables / .env, same convention as the root config.yaml.
+
+# Mongo databases (same cluster, via MONGODB_URL).
+# MAIN_DB_NAME must match the live pipeline's DB_NAME (config.yaml at the
+# repo root) -- this job reads "companies" and writes "documents_v2" there.
+# BACKFILL_DB_NAME is this job's own database, used only to track progress;
+# it's fine (expected, even) for it to not exist yet on first run.
+MAIN_DB_NAME: transparencydb_dev
+BACKFILL_DB_NAME: archive_backfill
+
+# Whether to use GCS at all. Forced to false automatically when running on
+# Cloud Run (the bucket is mounted as a FUSE volume instead -- see README).
+USE_GCP: true
+
+# Wayback Machine coverage window to search for snapshots.
+START_YEAR: 1997
+END_YEAR: 2025
+
+# Rate limiting against web.archive.org. The CDX search API and the raw
+# snapshot endpoint are rate limited independently and are both aggressive.
+# The original script's pacing (2s CDX / 1s fetch) got blocked within
+# minutes in the 2026-09-29 Fitbit run, and once blocked, every further
+# request seemed to extend the block. So: pace slowly, and on any HTTP 429
+# the run stops outright (see cdx.RateLimited) -- no backoff-and-retry.
+# The *_BACKOFF_SECONDS values only apply to other transient errors
+# (5xx, timeouts).
+CDX_SLEEP_SECONDS: 12.0
+CDX_BACKOFF_SECONDS: 120.0
+FETCH_SLEEP_SECONDS: 15.0
+FETCH_BACKOFF_SECONDS: 180.0
+
+# Retry bookkeeping (see archive_backfill/db.py claim_*_batch). A 429 never
+# counts against MAX_RETRIES -- rows a rate-limited run didn't finish are
+# released back to their prior state.
+MAX_RETRIES: 5
+RETRY_BACKOFF_MINUTES: 60
+
+# How much work one job execution takes on before exiting cleanly so the
+# next scheduled execution can continue. 0 = no limit on that axis (run
+# until there's truly nothing eligible left to do, or the process is killed
+# by Cloud Run's own task timeout). Progress is checkpointed continuously,
+# so any of these interrupting a run is always safe.
+# Kept small on purpose: a few dozen requests a night stays well under
+# archive.org's limits, and the nightly schedule does the rest.
+TIME_BUDGET_SECONDS: 0
+DISCOVERY_BATCH_LIMIT: 10
+FETCH_BATCH_LIMIT: 25
+# Each run picks its own company automatically: it finishes whichever
+# company is already in progress, then moves on to the next unstarted one
+# (alphabetically). This caps how many companies one run works through --
+# a company where the Wayback Machine has no snapshots doesn't count toward
+# it. The batch limits above are shared across those companies. 0 = no
+# per-company focus (spread the batch limits across every company at once).
+COMPANIES_PER_RUN: 1
+
+# Quality gating -- reuses the live pipeline's own policy-document
+# classifier (source/policy_classifier.py) and fuzzy-diff duplicate
+# detection (source/async_compare.py) so this ingestion path can't
+# reintroduce the bad-capture problem that scripts/find_bad_captures.py
+# and scripts/delete_flagged_captures.py were built to clean up.
+FUZZY_THRESHOLD: 94
+USE_POLICY_CLASSIFIER: true
+POLICY_CLASSIFIER_THRESHOLD: 0.3
+
+MAX_WORKERS: 4
+
+# Regenerates .CHANGES.json (source/changes.py) for every company that got
+# at least one new backfilled capture this run, so the Comparison Tool's
+# diff chain picks up the new historical snapshots immediately.
+CREATE_CHANGES: true
+
+USE_SLACK: true

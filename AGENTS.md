@@ -83,6 +83,7 @@ def store_document(result):
 - `source/utils.py` — shared utilities: MongoDB connection, GCS helpers, `DocumentCache`, `format_data`
 - `source/globals.py` — `CFG` config object and shared `logger`; initialized once at startup
 - `config.yaml` — runtime configuration: priority tiers, fuzzy threshold, topic patterns, format settings, policy-classifier toggle/threshold, boundary-classifier toggle/threshold
+- `archive_backfill/` — separate Cloud Run job that backfills historical Wayback Machine snapshots into `documents_v2`; tracks progress in its own `archive_backfill` Mongo database, picks one company per run automatically (`db.pick_next_company`), and stops on the first HTTP 429 (see README's "Wayback Backfill Job")
 - `docker-compose.yml` / `Dockerfile` — container setup for production-equivalent runs
 - `requirements.txt` — runtime dependencies
 - `requirements-dev.txt` — dev dependencies (`pre-commit`, `ruff`)

@@ -249,6 +249,45 @@ LOG_DIR should be set within the mount path of the Storage Bucket. (Recommended:
 
 MONGODB_URL should be established as a secret using the Google Cloud Platform Secret Manager.  This cannot use the local connection string.  
 
+### Wayback Backfill Job: `archive_backfill/`
+
+The live pipeline above only captures documents going forward from whenever a company is first added. `archive_backfill/` is a separate, self-contained job that fills in a company's *history* by pulling historical snapshots of its policy document urls from the [Wayback Machine](https://web.archive.org/), so the Comparison Tool's diff chain can extend back to whenever a page was first archived -- potentially as far back as 1997.
+
+It's a distinct Cloud Run Job from `document-capture`, with its own Dockerfile, requirements, and config, so it can be built, deployed, and scheduled independently. It still reads `companies` and writes `documents_v2` in the same production MongoDB database and GCS bucket as the live pipeline, so backfilled captures show up in the Comparison Tool immediately alongside live crawls, and it reuses the live pipeline's own text-reconstruction, quality-classifier, and `.CHANGES.json` generation code (`source/async_compare.py`, `source/policy_classifier.py`, `source/changes.py`) so a backfilled capture is held to the exact same quality bar as a live one.
+
+Because the Wayback Machine rate-limits fairly aggressively, this job works through its list of work by design, over many separate executions rather than one long run. Progress is tracked step-by-step in its own MongoDB database (`BACKFILL_DB_NAME`, separate from the live pipeline's database but on the same cluster) across two collections:
+
+- `discovery_progress` -- one row per (company, document type, url): has the Wayback Machine's CDX API been queried for this url's available snapshot timestamps yet?
+- `fetch_progress` -- one row per discovered (company, document type, url, timestamp): has that specific snapshot been downloaded, quality-checked, and stored?
+
+Every row is updated the moment its step completes, so a run that's stopped partway through (a time budget, a Cloud Run task timeout, a crash) always resumes cleanly on the next scheduled execution instead of losing progress -- see `archive_backfill/db.py`.
+
+Each run works on one company at a time, chosen automatically: it finishes whichever company is already in progress before starting the next unstarted one (alphabetically), so each platform's history fills in completely before moving on. `COMPANIES_PER_RUN` caps how many companies a run works through (default 1; a company where the Wayback Machine has no snapshots doesn't count toward it), and `DISCOVERY_BATCH_LIMIT`/`FETCH_BATCH_LIMIT` cap the total requests per run across them. A run also stops outright on the first HTTP 429 from web.archive.org.
+
+To build and deploy it:
+
+```powershell
+# Build and push the image (context is the repo root -- see archive_backfill/Dockerfile)
+./archive_backfill/upload.ps1
+
+# Deploy as its own Cloud Run Job (adjust flags to match your project/bucket/mongo secret)
+gcloud run jobs deploy archive-backfill `
+    --image us-east4-docker.pkg.dev/<project>/document-capture/archive_backfill:1.0 `
+    --region us-east4 `
+    --add-volume name=docstore,type=cloud-storage,bucket=<your-bucket> `
+    --add-volume-mount volume=docstore,mount-path=/mnt `
+    --set-secrets MONGODB_URL=mongodb-url:latest `
+    --set-env-vars GCP_BUCKET=<your-bucket>,GCLOUD_PROJECT=<your-project>,CAPTURES_DIR=/mnt `
+    --task-timeout 24h
+
+# Trigger it nightly via Cloud Scheduler
+./archive_backfill/scheduler.ps1
+```
+
+Configuration is split the same way as the live pipeline: `archive_backfill/.env.local` documents the environment variables (Mongo connection, GCP bucket, Slack webhook), and `archive_backfill/config.yaml` holds tunables (Wayback coverage window, rate-limit pacing, retry counts, batch/time budgets, quality-gate thresholds).
+
+One current limitation: a document type made up of more than one url (see "Support multi-URL doc types" in the commit history) isn't backfilled automatically -- the Wayback Machine's coverage can differ significantly between each component url, and naively merging independently-chosen snapshot dates per url would produce a misleading combined history. These are recorded with `status: "skipped_multi_url"` in `discovery_progress` for visibility rather than silently dropped.
+
 ## Related Repositories
 
 This project is part of the Transparency Hub ecosystem maintained by the Berkman Klein Center for Internet & Society at Harvard University:
