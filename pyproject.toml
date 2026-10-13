@@ -29,6 +29,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Puts the repo root on sys.path so tests can import source/ and
+# archive_backfill/ under a plain `pytest` (CI), not just `python -m pytest`
+pythonpath = ["."]
 addopts = "-ra"
 
 [tool.coverage.run]
