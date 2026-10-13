@@ -7,6 +7,7 @@ dependencies = [
     "bs4>=0.0.2",
     "charset-normalizer>=3.4.2",
     "docker>=7.1.0",
+    "requests>=2.32.3",
     "langdetect>=1.0.9",
     "lxml>=6.0.4",
     "pymongo>=4.13.2",
@@ -31,7 +32,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.coverage.run]
-source = ["source", "main"]
+source = ["source", "main", "archive_backfill"]
 omit = ["tests/*"]
 
 [tool.coverage.report]

@@ -116,3 +116,7 @@ archive_backfill/data/
 # Powershell Scripts
 upload.ps1
 scheduler.ps1
+
+# Local data exports / research output -- production data, never commit
+transparencydb_dev.*.json
+*_candidates.jsonl
