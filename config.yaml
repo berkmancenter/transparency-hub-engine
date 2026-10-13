@@ -125,10 +125,13 @@ MEMORY_SOFT_LIMIT_RATIO: 0.85
 # A company that isn't in this dictionary gets DEFAULT_PRIORITY
 # It will ignore unknown company_ids
 #
-# The priority-1 (monthly) entries below were generated on 2026-10-13: companies
-# marked Inactive, plus companies whose website isn't in the Tranco top-1M list
-# (tranco-list.eu, list 64VKX) and that have no Wikipedia article -- roughly the
-# least-used ~28% of the dataset. Move a company between tiers by editing its entry.
+# Companies whose metadata.status is "Inactive" are never captured, whatever their
+# priority (they stay in the database for programmatic access only).
+#
+# The priority-1 (monthly) entries below were generated on 2026-10-13: active
+# companies whose website isn't in the Tranco top-1M list (tranco-list.eu, list
+# 64VKX) and that have no Wikipedia article -- roughly the least-used ~25% of the
+# active dataset. Move a company between tiers by editing its entry.
 
 # Priority for companies without a PRIORITY_DICT entry (defaults to 1)
 DEFAULT_PRIORITY: 2
@@ -152,10 +155,8 @@ PRIORITY_DICT:
   # Monthly tier (priority 1)
   "6840b084a96cab74c26a320c" : 1 # Achat Pro
   "6840b084a96cab74c26a3218" : 1 # AHA Live Video Chat
-  "6840b084a96cab74c26a321c" : 1 # Amino (Inactive)
   "68544d58978e42ce21fe1a05" : 1 # Animated 3D Emoji Stickers
   "6840b087a96cab74c26a3276" : 1 # AutoSender Pro
-  "68544a3953c40294de273643" : 1 # BESTY (Inactive)
   "6840b087a96cab74c26a3240" : 1 # BirthdaysPro HD
   "684340244d9c4a4324f5b28a" : 1 # Bluetooth Messenger
   "6840b084a96cab74c26a31f5" : 1 # Blush
@@ -171,10 +172,8 @@ PRIORITY_DICT:
   "6840b087a96cab74c26a325f" : 1 # ContactsPro HX
   "6840b087a96cab74c26a3285" : 1 # Control Panel for Twitter
   "6840b087a96cab74c26a3239" : 1 # Cute Emoticon Keyboard
-  "6840b087a96cab74c26a324a" : 1 # Darling (Inactive)
   "6840b087a96cab74c26a3267" : 1 # DefaultSMS
   "6840b084a96cab74c26a320a" : 1 # DirectChat
-  "684340244d9c4a4324f5b287" : 1 # DUBS (Inactive)
   "6840b087a96cab74c26a327a" : 1 # Emoji for Message Pro
   "684340244d9c4a4324f5b28c" : 1 # Enneagram Premium
   "69e0ff896e732293bfd02041" : 1 # Euki
@@ -183,7 +182,6 @@ PRIORITY_DICT:
   "68544a3953c40294de273641" : 1 # Fake Status
   "684340244d9c4a4324f5b288" : 1 # Fav Talk
   "6ace8f3378fd156925286c26" : 1 # Fizz
-  "6840b084a96cab74c26a31df" : 1 # Flip (Inactive)
   "6840b087a96cab74c26a329b" : 1 # Flirtini
   "6840b087a96cab74c26a324b" : 1 # Followers & Unfollow Tracker.
   "6840b084a96cab74c26a31ec" : 1 # Free Tone
@@ -192,7 +190,6 @@ PRIORITY_DICT:
   "6840b087a96cab74c26a3264" : 1 # Gay Older Men Chat
   "6840b082a96cab74c26a31c2" : 1 # Genesia AI
   "6840b087a96cab74c26a326b" : 1 # Gibberish Writer
-  "6840b087a96cab74c26a3266" : 1 # GR8 (Inactive)
   "6840b087a96cab74c26a3262" : 1 # Greeting Cards App
   "6840b087a96cab74c26a322b" : 1 # Griddy Pro
   "6840b087a96cab74c26a3227" : 1 # Handwritten email
@@ -214,7 +211,6 @@ PRIORITY_DICT:
   "684c938767bd9598d5b634af" : 1 # LitUp
   "6840b084a96cab74c26a31f0" : 1 # Local Single
   "68544a3153c40294de273635" : 1 # Lumi
-  "68544d58978e42ce21fe1a04" : 1 # Mast (Inactive)
   "6840b084a96cab74c26a320d" : 1 # MICO
   "6840b082a96cab74c26a31c7" : 1 # Mimico
   "6840b084a96cab74c26a31ed" : 1 # Mind Warriors Hub
@@ -228,9 +224,7 @@ PRIORITY_DICT:
   "68544a3953c40294de27363e" : 1 # Pixelix
   "684340244d9c4a4324f5b28b" : 1 # PixWatch for Google Photos
   "6840b084a96cab74c26a31f8" : 1 # Plamfy
-  "6840b087a96cab74c26a325d" : 1 # PNK (Inactive)
   "68544efa3a6978981fe94afa" : 1 # Private Safe Texting Message
-  "6840b087a96cab74c26a3270" : 1 # Puerto Bikers (Inactive)
   "6840b084a96cab74c26a3222" : 1 # purp
   "684c938f67bd9598d5b634b9" : 1 # Purrrr
   "69e100d46e732293bfd02044" : 1 # QRing
@@ -245,9 +239,7 @@ PRIORITY_DICT:
   "6840b087a96cab74c26a3233" : 1 # SkyText
   "6840b084a96cab74c26a31f3" : 1 # Slootopia
   "6840b087a96cab74c26a328a" : 1 # SocialFocus
-  "69537d3e65453d8415146100" : 1 # Sora (Inactive)
   "684c938767bd9598d5b634ad" : 1 # SparkV
-  "6840b087a96cab74c26a3265" : 1 # Speech to Text (Inactive)
   "6840b087a96cab74c26a3284" : 1 # SpeedLight Viewer
   "68544a3953c40294de273646" : 1 # Spool for Safari
   "6840b087a96cab74c26a327e" : 1 # Spring for Twitter
@@ -264,7 +256,6 @@ PRIORITY_DICT:
   "6840b087a96cab74c26a3269" : 1 # Symbol Pad Pro
   "6840b087a96cab74c26a3252" : 1 # TalkU
   "6840b082a96cab74c26a31cb" : 1 # TanTan
-  "6840b087a96cab74c26a326a" : 1 # Taylor Time (Inactive)
   "6840b084a96cab74c26a31de" : 1 # Text Me
   "6840b087a96cab74c26a324d" : 1 # Tik Saver Pro
   "6840b087a96cab74c26a3250" : 1 # Topics
@@ -284,10 +275,7 @@ PRIORITY_DICT:
   "6840b084a96cab74c26a31ee" : 1 # Wizz App
   "6840b087a96cab74c26a3254" : 1 # WooPlus
   "6840b087a96cab74c26a3287" : 1 # World of WIT
-  "6840b087a96cab74c26a3282" : 1 # WristChat for Facebook (Inactive)
   "6840b087a96cab74c26a326d" : 1 # WtfAgain for Web Messenger
-  "6772ca874b443c7c16d5b244" : 1 # Yareny (Inactive)
-  "68544a3953c40294de273648" : 1 # YNK (Inactive)
   "68544a3953c40294de27363d" : 1 # YT Shorts Blocker
   "6840b084a96cab74c26a31f2" : 1 # Zanex
   "6840b087a96cab74c26a326e" : 1 # Zing Txt

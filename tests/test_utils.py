@@ -204,6 +204,30 @@ class TestGetValidatedCompanies:
         assert result == sample_companies
 
 
+class TestInactiveCompanies:
+    @pytest.mark.parametrize("use_local", [False, True])
+    def test_inactive_companies_are_never_captured(self, monkeypatch, use_local):
+        companies = [
+            {
+                "_id": cid,
+                "id": cid,
+                "name": cid,
+                "doc_urls": {},
+                "metadata": {"status": status},
+            }
+            for cid, status in (("live", "Active"), ("retired", "Inactive"))
+        ]
+        monkeypatch.setattr(utils, "get_all_companies", lambda: companies)
+        CFG.USE_LOCAL_COMPANIES = use_local
+        CFG.SYNC_PRIORITY = 1
+        # Even an explicit daily priority doesn't override Inactive
+        CFG.PRIORITY_DICT = {"retired": 3}
+
+        result = utils.get_validated_companies()
+
+        assert [c["_id"] for c in result] == ["live"]
+
+
 class TestCaptureTiers:
     """Daily (3) / weekly (2, the default) / monthly (1) capture tiers, as
     configured in production: DEFAULT_PRIORITY 2, fringe companies listed at

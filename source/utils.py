@@ -110,6 +110,17 @@ def get_validated_companies() -> list:
         p for p in pData if "_id" in p and "id" in p and "name" in p and "doc_urls" in p
     ]
 
+    # Inactive companies stay in the database for programmatic access, but
+    # never get new captures, whatever their priority
+    inactive = [
+        p for p in pData if (p.get("metadata") or {}).get("status") == "Inactive"
+    ]
+    if inactive:
+        logger.info(
+            f"Skipping {len(inactive)} inactive compan(y/ies): {', '.join(p['name'] for p in inactive)}"
+        )
+        pData = [p for p in pData if p not in inactive]
+
     # Check if there is any priority filtering that needs to be done
     # First, make sure we aren't using a local companies input
     if CFG.USE_LOCAL_COMPANIES:
