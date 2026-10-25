@@ -14,7 +14,9 @@ import shutil
 import json
 import time
 import random
+import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import urllib.request
 
 # Local Imports
@@ -34,6 +36,16 @@ def initialize_sync():
 
 def join_path(path, *paths) -> Path:
     return Path(os.path.normpath(os.path.join(path, *paths)))
+
+
+def normalize_seed_url(url: str) -> str:
+    """
+    Normalizes a url just enough to match a crawled page's recorded url back
+    to the doc_urls seed it came from (fragment and trailing slash dropped,
+    since the crawler may record either form). Query strings are kept, since
+    they can select genuinely different content.
+    """
+    return url.split("#", 1)[0].rstrip("/")
 
 
 def mongo_connect():
@@ -59,6 +71,7 @@ def get_all_companies() -> list:
     Fetches all companies from MongoDB or specified JSON or BSON file, depending on USE_MONGO and USE_LOCAL_COMPANIES flag.
     """
     if CFG.USE_MONGO and not CFG.USE_LOCAL_COMPANIES:
+        client = None
         try:
             client = mongo_connect()
             collection = client[CFG.DB_NAME]["companies"]
@@ -70,8 +83,9 @@ def get_all_companies() -> list:
         except Exception as e:
             raise Exception(f"Failed to fetch companies from MongoDB: {e}")
         finally:
-            # Close the client connection
-            client.close()
+            # Close the client connection, if one was ever established
+            if client is not None:
+                client.close()
     else:
         return pull_db(CFG.COMPANIES_JSON, False)
 
@@ -96,30 +110,39 @@ def get_validated_companies() -> list:
         p for p in pData if "_id" in p and "id" in p and "name" in p and "doc_urls" in p
     ]
 
+    # Inactive companies stay in the database for programmatic access, but
+    # never get new captures, whatever their priority
+    inactive = [
+        p for p in pData if (p.get("metadata") or {}).get("status") == "Inactive"
+    ]
+    if inactive:
+        logger.info(
+            f"Skipping {len(inactive)} inactive compan(y/ies): {', '.join(p['name'] for p in inactive)}"
+        )
+        pData = [p for p in pData if p not in inactive]
+
     # Check if there is any priority filtering that needs to be done
     # First, make sure we aren't using a local companies input
     if CFG.USE_LOCAL_COMPANIES:
         return pData
     # Then, check if there is a priority list
     logger.info("Applying priority filtering, see config file for details")
-    if CFG.PRIORITY_DICT != {}:
-        # Then exclude any companies with a priority of 0
-        pExclude = [
+    if CFG.PRIORITY_DICT != {} or CFG.DEFAULT_PRIORITY != 1:
+        # A company's priority is its PRIORITY_DICT entry, or DEFAULT_PRIORITY
+        # when it has none. Priority 0 is never captured; otherwise a run
+        # captures every company with SYNC_PRIORITY <= priority, capped at
+        # SYNC_PRIORITY_MAX when that's set (e.g. a monthly run that only
+        # captures the priority-1 tier). See config.yaml's PRIORITY_DICT.
+        def priority(p: dict) -> int:
+            return CFG.PRIORITY_DICT.get(str(p["_id"]), CFG.DEFAULT_PRIORITY)
+
+        pData = [
             p
             for p in pData
-            if CFG.PRIORITY_DICT.get(str(p["_id"]))
-            and CFG.PRIORITY_DICT[str(p["_id"])] == 0
+            if priority(p) != 0
+            and priority(p) >= CFG.SYNC_PRIORITY
+            and (not CFG.SYNC_PRIORITY_MAX or priority(p) <= CFG.SYNC_PRIORITY_MAX)
         ]
-        pData = [p for p in pData if p not in pExclude]
-        # If SYNC_PRIORITY is 1, we're all set, otherwise run one more filter
-        if CFG.SYNC_PRIORITY > 1:
-            # Then exclude any companies with a priority less than SYNC_PRIORITY
-            pData = [
-                p
-                for p in pData
-                if CFG.PRIORITY_DICT.get(str(p["_id"]))
-                and CFG.PRIORITY_DICT[str(p["_id"])] >= CFG.SYNC_PRIORITY
-            ]
 
     return pData
 
@@ -138,12 +161,29 @@ def format_data(companyData: list) -> list:
     listData = []
 
     # Iterate through the company data and make a new object for each document found
+    # doc_urls entries are keyed by display name (e.g. "Privacy Policy") and hold
+    # {"name": <display name>, "urls": [<url>, ...]} -- a doc type can list more
+    # than one url (a document split across pages), so all of them are crawled
+    # together as a single unit and merged into one captured document.
     for cObj in companyData:
         if cObj.get("doc_urls"):
-            for docType in cObj["doc_urls"]:
+            for docType, docEntry in cObj["doc_urls"].items():
+                # docEntry is expected to be {"name": ..., "urls": [...]}, but
+                # get_validated_companies only checks that "doc_urls" exists on
+                # the company, not the shape of each entry -- a malformed or
+                # still-old-schema (bare string) entry shouldn't be able to
+                # crash format_data() for every OTHER company in the same run.
+                urls = docEntry.get("urls") if isinstance(docEntry, dict) else None
+                if not urls:
+                    if docEntry:
+                        logger.warning(
+                            f"Skipping malformed doc_urls entry for {cObj.get('name', cObj.get('_id'))} "
+                            f"({docType}): expected {{'urls': [...]}}, got {docEntry!r}"
+                        )
+                    continue
                 listData.append(
                     {
-                        "url": cObj["doc_urls"][docType],
+                        "urls": urls,
                         # Typecast the _id to a string, as sometimes it's an ObjectId
                         "objId": str(cObj["_id"]),
                         "name": cObj.get("name", "Unknown"),
@@ -152,27 +192,28 @@ def format_data(companyData: list) -> list:
                 )
 
     iCData = {}
-    # Iterate through the list of URLs to find any duplicates,
+    # Iterate through the url groups to find any duplicates,
     # Then collate the requests to prevent duplicates while preserving relevant information
     logger.info(f"Excluding Recovery Data from this run: {CFG.RECOVERY_DATA}")
     for lObj in listData:
-        if lObj["url"] in CFG.RECOVERY_DATA:
+        if any(url in CFG.RECOVERY_DATA for url in lObj["urls"]):
             # This document was already captured in a previous attempted run that did not complete
             logger.info(
-                f"Document {lObj['url']} has already been captured, skipping..."
+                f"Document {lObj['urls']} has already been captured, skipping..."
             )
             continue
-        if lObj["url"] in iCData:
-            # Found a duplicate url, so let's add the company information to the same request
+        urlKey = tuple(lObj["urls"])
+        if urlKey in iCData:
+            # Found a duplicate url group, so let's add the company information to the same request
             logger.info(
-                f"Duplicate document url {lObj['url']} found for {lObj['objId']}, collating requests..."
+                f"Duplicate document urls {lObj['urls']} found for {lObj['objId']}, collating requests..."
             )
-            iCData[lObj["url"]].append(lObj)
+            iCData[urlKey].append(lObj)
         else:
-            iCData[lObj["url"]] = [lObj]
+            iCData[urlKey] = [lObj]
 
-    # Reconstruct the data into a list of dictionaries
-    formattedListData = list(iCData.items())
+    # Reconstruct the data into a list of (urls, entries) tuples
+    formattedListData = [(list(urlKey), entries) for urlKey, entries in iCData.items()]
     # Shuffle the list of URLs to distribute them across the workers
     # Prevent any single host from getting too many simultaneous requests at once
     random.shuffle(formattedListData)
@@ -235,7 +276,10 @@ def update_Mongo(results: list, collection):
         for result in results:
             try:
                 collection.insert_one(result)
-                logger.info(f"Successfully uploaded {result['path']} to MongoDB")
+                formats = list(result.get("formats", {}).keys())
+                logger.info(
+                    f"Successfully uploaded {result['path']} (formats: {formats}) to MongoDB"
+                )
             except Exception as e:
                 logger.error(f"Failed to upload document to MongoDB: {e}")
     except Exception as e:
@@ -243,18 +287,38 @@ def update_Mongo(results: list, collection):
         raise e
 
 
-def get_gcs_bytes(gcp_path, bucket) -> bytes:
+def _read_local_file_bytes(path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def get_gcs_bytes(gcp_path, bucket, timeout: float = 120) -> bytes:
     """
     Returns the bytes of a file in a Google Cloud Storage bucket or from a local directory if USE_GCP is False
+
+    Raises:
+      TimeoutError: If the read doesn't complete within `timeout` seconds. Reads against the
+        GCS FUSE mount (used when IN_CLOUD) are plain filesystem calls with no built-in timeout,
+        so unlike the direct GCS API call below, they can hang indefinitely on a stalled mount.
+        The read is run in a background thread so a stuck call can be abandoned on timeout
+        instead of blocking the whole pipeline.
     """
     logger.info(f"Downloading {gcp_path} from GCS...")
     if CFG.IN_CLOUD or not CFG.USE_GCP:
-        with open(join_path(CFG.CAPTURES_DIR, gcp_path), "rb") as f:
-            file_bytes = f.read()
-        return file_bytes
+        local_path = join_path(CFG.CAPTURES_DIR, gcp_path)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_read_local_file_bytes, local_path)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            raise TimeoutError(
+                f"Reading {local_path} from the GCS FUSE mount timed out after {timeout}s"
+            )
+        finally:
+            executor.shutdown(wait=False)
     else:
         blob = bucket.blob(str(gcp_path))
-        return blob.download_as_bytes(timeout=120)
+        return blob.download_as_bytes(timeout=timeout)
 
 
 def decode_bytes(bytes) -> str:
@@ -291,10 +355,18 @@ class DocumentCache:
         else:
             if len(self._cache) >= self.capacity:
                 self._cache.popitem(last=False)  # Evict LRU (front)
-            self._cache[path] = text
+        self._cache[path] = text
 
     def __len__(self) -> int:
         return len(self._cache)
+
+
+# Guards the local-mode (CFG.USE_MONGO=False) bson file append below.
+# source/changes.py's create_changes_json now processes (company_id, type)
+# groups concurrently via a ThreadPoolExecutor, and each group calls save_db
+# independently -- without this lock, two threads' "open(..., 'ab')" +
+# write() calls could interleave and corrupt the shared local database file.
+_save_db_lock = threading.Lock()
 
 
 def save_db(db: list[dict], dbPath: Path):
@@ -307,14 +379,15 @@ def save_db(db: list[dict], dbPath: Path):
 
     """
     logger.info(f"Writing new documents to {dbPath}")
-    with open(dbPath, "ab") as f:
-        for dbItem in db:
-            # Make sure all items have an ObjectId
-            if dbItem.get("_id") is None:
-                new_oid = ObjectId()
-                dbItem["_id"] = new_oid
-            # Save each item to the bson file
-            f.write(bson.encode(dbItem))
+    with _save_db_lock:
+        with open(dbPath, "ab") as f:
+            for dbItem in db:
+                # Make sure all items have an ObjectId
+                if dbItem.get("_id") is None:
+                    new_oid = ObjectId()
+                    dbItem["_id"] = new_oid
+                # Save each item to the bson file
+                f.write(bson.encode(dbItem))
     logger.info(f"Completed write to {dbPath}")
 
 
@@ -365,6 +438,61 @@ def pull_db(dbPath: Path, createNew: bool = True) -> list[dict]:
         raise e
 
 
+def get_nested(doc: dict, dotted_key: str):
+    """
+    Resolves a dot-notation key (e.g. "formats.txt") against a nested dict,
+    mirroring how MongoDB resolves dotted field paths in queries.
+    """
+    value = doc
+    for part in dotted_key.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def matches_query(doc: dict, query: dict) -> bool:
+    """
+    Checks whether a single document matches a Pymongo-style query dict.
+    Supports dot-notation keys and the "$exists" operator, since that's all
+    this capture process currently needs from a hand-rolled query matcher.
+    """
+    for key, expected in query.items():
+        actual = get_nested(doc, key)
+        if isinstance(expected, dict) and "$exists" in expected:
+            if (actual is not None) != bool(expected["$exists"]):
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def local_find(
+    db: list[dict], query: dict, sort: list[tuple] | None = None
+) -> list[dict]:
+    """
+    Perform Pymongo find operation on a Python list[dict] in memory
+    This is only feature complete to the extent needed by this capture process
+
+    Args:
+      db (list[dict]): A python list representing the data collection
+      query (dict): A dictionary of key value pairs that must be matched by the returned items
+      sort (list[tuple]): Optional, defaults to None, sorts the matched items before returning
+
+    Returns:
+      list[dict]: Every item matching the query, sorted if requested
+    """
+    # Perform query matching
+    results = [dbItem for dbItem in db if matches_query(dbItem, query)]
+
+    # Apply all sort operations using consistent priority to pymongo find
+    if sort:
+        for key, direction in reversed(sort):
+            results.sort(key=lambda a: a[key], reverse=(direction == -1))
+
+    return results
+
+
 def local_find_one(
     db: list[dict], query: dict, sort: list[tuple] | None = None
 ) -> dict | None:
@@ -380,17 +508,7 @@ def local_find_one(
     Returns:
       dict | None: The first item after filtering with the query and sorting, or None if no items matched the query
     """
-    # Perform query matching
-    results = [
-        dbItem for dbItem in db if all(dbItem.get(a) == b for a, b in query.items())
-    ]
-
-    # Apply all sort operations using consistent priority to pymongo find_one
-    if sort:
-        for key, direction in reversed(sort):
-            results.sort(key=lambda a: a[key], reverse=(direction == -1))
-
-    # Return first result
+    results = local_find(db, query, sort=sort)
     return results[0] if results else None
 
 

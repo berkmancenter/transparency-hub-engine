@@ -6,6 +6,8 @@
 # These crawl results will then be parsed by process.py
 
 # Imports
+import concurrent.futures
+import threading
 import time
 from typing import List, Dict
 import sys
@@ -21,20 +23,48 @@ class BrowsertrixCrawler:
 
     Args:
       dockerImage (str): The string name of the docker image of the custom browsertrix fork
-      maxWorkers (int): The maximum amount of workers to use during the capture process at one time
     """
 
     def __init__(
         self,
-        dockerImage: str = "browsertrix-thub:1.1",
-        maxWorkers: int = CFG.MAX_WORKERS,
+        dockerImage: str = "browsertrix-thub:1.2",
         mode: str = "document_capture",
     ):
         self.dockerImage = dockerImage
-        self.maxWorkers = maxWorkers
         self.mode = mode
+        # Lazily created and cached on first use (see _get_docker_client /
+        # _get_jobs_client below) -- this instance persists for the whole
+        # pipeline run and is reused across every crawl (run_single_crawl is
+        # called once per url group), so reconnecting the Docker/Cloud Run
+        # SDK client on every single call was pure overhead. Guarded by a
+        # lock since run_single_crawl runs concurrently from multiple worker
+        # threads -- same lazy-singleton pattern source/policy_classifier.py
+        # and source/boundary_classifier.py use to cache their models.
+        self._dockerClient = None
+        self._jobsClient = None
+        self._clientLock = threading.Lock()
 
-    def create_crawl_command(self, url: str, crawlName: str) -> List[str]:
+    def _get_docker_client(self):
+        """Lazily creates and caches the Docker SDK client, reused across every crawl this instance runs."""
+        if self._dockerClient is None:
+            with self._clientLock:
+                if self._dockerClient is None:
+                    import docker  # type: ignore
+
+                    self._dockerClient = docker.from_env()
+        return self._dockerClient
+
+    def _get_jobs_client(self):
+        """Lazily creates and caches the Cloud Run Jobs client, reused across every crawl this instance runs."""
+        if self._jobsClient is None:
+            with self._clientLock:
+                if self._jobsClient is None:
+                    from google.cloud import run_v2  # type: ignore
+
+                    self._jobsClient = run_v2.JobsClient()
+        return self._jobsClient
+
+    def create_crawl_command(self, urls: List[str], crawlName: str) -> List[str]:
         """ """
         if CFG.IN_LOCAL:
             # These options are only used when running this as a python script
@@ -54,19 +84,24 @@ class BrowsertrixCrawler:
             cmd = []
 
         # These are the base options for running the fork programmatically
+        cmd = cmd + ["crawl"]
+        # A doc type can list more than one url (a document split across pages) --
+        # repeat --url per url rather than relying on yargs' array-flag value
+        # collection, so each url is unambiguous regardless of position
+        for url in urls:
+            cmd = cmd + ["--url", url]
         cmd = cmd + [
-            "crawl",
-            "--url",
-            url,
             "--collection",
             crawlName,
             "--detachedHTML",  # Generate detached HTML (Custom Fork Param)
             "--behaviors",
             "autoscroll,autoplay,autofetch",  # Auto behaviors
-            "--behavior-timeout",
+            "--behaviorTimeout",
             "30",
             "--timeout",
-            "90",
+            "105",
+            "--postLoadDelay",
+            "8",
         ]
 
         # With plans to add more modes, this will need to be expanded, but for now document_capture is the only valid mode
@@ -80,12 +115,13 @@ class BrowsertrixCrawler:
                 "fullPage",
                 "--text",
                 "to-pages",
-                "--depth",
-                "1",
+                # Capture only the seed urls themselves (the doc_urls entry's
+                # pages), never links discovered on them. Following in-scope
+                # links (previously --depth 1 --scopeType prefix --pageLimit
+                # 20) never fed the merged .txt -- only seed pages get
+                # detached text -- but roughly doubled crawl time.
                 "--scopeType",
-                "prefix",
-                "--pageLimit",
-                "20",
+                "page",
                 # This will exclude links with query parameters, and reduce time and size
                 # Some query parameters are irrelevant, haven't found an efficient way to exclude them
                 # Hasn't been working as expected in testing
@@ -97,12 +133,12 @@ class BrowsertrixCrawler:
 
     def run_single_crawl(self, pData: Dict, crawlName: str) -> List[Dict]:
         """ """
-        url = pData["url"]
+        urls = pData["urls"]
         pValues = pData["pValues"]
 
-        cmd = self.create_crawl_command(url, crawlName)
+        cmd = self.create_crawl_command(urls, crawlName)
 
-        logger.info(f"Starting crawl '{crawlName}' with {url}")
+        logger.info(f"Starting crawl '{crawlName}' with {', '.join(urls)}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         startTime = time.time()
@@ -136,7 +172,7 @@ class BrowsertrixCrawler:
                         {
                             "crawl_name": crawlName,
                             "success": True,
-                            "url": url,
+                            "urls": urls,
                             "objId": pValue["objId"],
                             "name": pValue["name"],
                             "pType": pValue["pType"],
@@ -155,7 +191,7 @@ class BrowsertrixCrawler:
                         {
                             "crawl_name": crawlName,
                             "success": False,
-                            "url": url,
+                            "urls": urls,
                             "pValues": pValues,
                             "duration": duration,
                             "error": result.returncode,
@@ -167,7 +203,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": "Timeout after 20 minutes",
                     }
@@ -180,7 +216,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }
@@ -189,8 +225,8 @@ class BrowsertrixCrawler:
         elif CFG.IN_DOCKER:
             import docker  # type: ignore
 
-            # Open a docker client to run the crawler
-            client = docker.from_env()
+            # Reuse the cached docker client rather than reconnecting per crawl
+            client = self._get_docker_client()
 
             try:
                 container = client.containers.run(
@@ -218,7 +254,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": True,
-                        "url": url,
+                        "urls": urls,
                         "objId": pValue["objId"],
                         "name": pValue["name"],
                         "pType": pValue["pType"],
@@ -227,7 +263,7 @@ class BrowsertrixCrawler:
                     for pValue in pValues
                 ]
             except docker.errors.ContainerError as e:  # type: ignore
-                end_time = time.time()
+                endTime = time.time()
                 duration = endTime - startTime
 
                 logger.error(
@@ -240,10 +276,10 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "duration": duration,
-                        "error": e.exitcode,
+                        "error": e.exit_status,
                     }
                 ]
             except Exception as e:
@@ -254,7 +290,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }
@@ -263,8 +299,8 @@ class BrowsertrixCrawler:
         elif CFG.IN_CLOUD:
             from google.cloud import run_v2  # type: ignore
 
-            # Open a google client to run the crawler
-            client = run_v2.JobsClient()
+            # Reuse the cached jobs client rather than reconnecting per crawl
+            client = self._get_jobs_client()
 
             job_path = f"projects/{CFG.GCLOUD_PROJECT}/locations/{CFG.GCLOUD_REGION}/jobs/{CFG.GCLOUD_JOB}"
 
@@ -275,8 +311,11 @@ class BrowsertrixCrawler:
 
                 operation = client.run_job(request=request)
 
-                # Calling operation.result() will block until the crawl is complete
-                operation.result()
+                # Calling operation.result() blocks until the crawl job completes.
+                # Bounded by CFG.TIMEOUT to match the local (subprocess.run) and
+                # Docker (container.wait) branches above -- without a timeout, a
+                # stuck Cloud Run job execution would hang this call forever.
+                operation.result(timeout=CFG.TIMEOUT)
 
                 endTime = time.time()
                 duration = endTime - startTime
@@ -291,13 +330,24 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": True,
-                        "url": url,
+                        "urls": urls,
                         "objId": pValue["objId"],
                         "name": pValue["name"],
                         "pType": pValue["pType"],
                         "duration": duration,
                     }
                     for pValue in pValues
+                ]
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Crawl '{crawlName}' timed out after {CFG.TIMEOUT}s")
+                return [
+                    {
+                        "crawl_name": crawlName,
+                        "success": False,
+                        "urls": urls,
+                        "pValues": pValues,
+                        "error": f"Timeout after {CFG.TIMEOUT}s",
+                    }
                 ]
             except Exception as e:
                 logger.error(
@@ -307,7 +357,7 @@ class BrowsertrixCrawler:
                     {
                         "crawl_name": crawlName,
                         "success": False,
-                        "url": url,
+                        "urls": urls,
                         "pValues": pValues,
                         "error": str(e),
                     }

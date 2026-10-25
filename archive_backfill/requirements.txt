@@ -1,0 +1,19 @@
+# Wayback Machine Historical Backfill job dependencies: everything the
+# reused source/ modules need (kept in sync with the repo root's
+# requirements.txt for those packages) plus `requests`, which this job uses
+# directly to talk to the CDX API and web.archive.org. Installed on its own
+# here (rather than reusing the root requirements.txt) so this job's Docker
+# image only builds what it actually needs -- see archive_backfill/Dockerfile.
+requests==2.32.3
+bs4==0.0.2
+charset-normalizer==3.4.2
+langdetect==1.0.9
+lxml==6.0.4
+pymongo==4.13.2
+PyPDF2==3.0.1
+python-dotenv==1.1.0
+PyYAML==6.0.2
+rapidfuzz==3.14.3
+google-cloud-storage==3.4.1
+scikit-learn==1.9.0
+joblib==1.5.3

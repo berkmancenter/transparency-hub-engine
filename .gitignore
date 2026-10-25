@@ -102,6 +102,21 @@ temp/
 db/
 tmp/
 
+# Policy-classifier training data: large, reproducible via
+# scripts/build_policy_dataset.py, and contains third-party page
+# text -- doesn't belong in git history. The trained model artifact
+# (models/*.joblib) is small and intentionally NOT ignored here.
+scripts/data/
+
+# archive_backfill operational output (e.g. precaptured_pairs.csv from
+# extract_precaptured_from_export.py) -- reproducible from a documents_v2
+# export, doesn't belong in git history either.
+archive_backfill/data/
+
 # Powershell Scripts
 upload.ps1
 scheduler.ps1
+
+# Local data exports / research output -- production data, never commit
+transparencydb_dev.*.json
+*_candidates.jsonl

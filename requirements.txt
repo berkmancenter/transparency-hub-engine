@@ -1,6 +1,7 @@
 bs4==0.0.2
 charset-normalizer==3.4.2
 docker==7.1.0
+requests==2.32.3
 langdetect==1.0.9
 lxml==6.0.4
 pymongo==4.13.2
@@ -10,3 +11,5 @@ PyYAML==6.0.2
 rapidfuzz==3.14.3
 google-cloud-storage==3.4.1
 google-cloud-run==0.16.0
+scikit-learn==1.9.0
+joblib==1.5.3

@@ -3,6 +3,8 @@
 # This file is designed to run within the sync, but can also be ran as a standalone script
 
 # Imports
+import concurrent.futures
+import gc
 import json
 import re
 import os
@@ -16,12 +18,119 @@ from source.utils import (
     decode_bytes,
     DocumentCache,
     pull_db,
-    local_find_one,
+    local_find,
     save_db,
 )
 
 if CFG.USE_MONGO:
     from pymongo.collection import Collection
+
+
+def _fetch_and_decode_with_retries(
+    path: str, bucket, doc_cache: DocumentCache, retries: int = 2
+) -> str | None:
+    """
+    Fetches and decodes a document's text via get_gcs_bytes, retrying on timeout.
+    Returns None (after logging) if it still fails after all retries, so the caller
+    can skip this pair instead of letting one stuck read crash the entire run.
+    """
+    for attempt in range(1, retries + 2):
+        try:
+            text = decode_bytes(get_gcs_bytes(path, bucket))
+            doc_cache.put(path, text)
+            return text
+        except TimeoutError as e:
+            logger.error(f"Attempt {attempt} failed fetching {path}: {e}")
+    logger.error(
+        f"Giving up on {path} after {retries + 1} attempts, skipping this pair"
+    )
+    return None
+
+
+def _fetch_html_trimmed(capture: dict, bucket, html_cache: DocumentCache) -> str | None:
+    """
+    Fetches a capture's html format (if it has one) and trims header/footer/
+    nav boilerplate off it via source/boundary_classifier.py, purely so the
+    diff written to .CHANGES.json reads cleaner in the Comparison Tool.
+
+    This is cosmetic only -- it's never used for change-detection, and a
+    None return (no html format, fetch failure, or classifier failure) just
+    tells the caller to fall back to the full untrimmed .txt, exactly as
+    before this existed.
+    """
+    formats = capture.get("formats") or {}
+    if "html" not in formats:
+        return None
+
+    try:
+        # Extension lookup included in the try/except -- malformed or legacy
+        # formats.html metadata (e.g. missing "extension") must fail open to
+        # the untrimmed .txt like any other failure here, not crash the run.
+        extension = formats["html"]["extension"]
+        path = f"{capture['path']}.{extension}"
+
+        cached = html_cache.get(path)
+        if cached is not None:
+            return cached
+
+        from source.boundary_classifier import extract_policy_text
+
+        html_bytes = get_gcs_bytes(path, bucket)
+        trimmed = extract_policy_text(html_bytes, threshold=CFG.DIFF_TRIMMER_THRESHOLD)
+        if not trimmed:
+            # No blocks extracted at all -- an empty diff would be more
+            # confusing than useful, so treat this the same as a failure
+            # and let the caller fall back to the untrimmed .txt.
+            return None
+        html_cache.put(path, trimmed)
+        return trimmed
+    except Exception as e:
+        logger.warning(
+            f"Diff trimmer failed for {capture['path']}, using untrimmed text instead: {e}"
+        )
+        return None
+
+
+def get_diff_text(
+    olderCapture: dict,
+    newerCapture: dict,
+    bucket,
+    doc_cache: DocumentCache,
+    html_cache: DocumentCache,
+) -> tuple[str | None, str | None]:
+    """
+    Returns the (older, newer) text to build a .CHANGES.json diff from.
+
+    When CFG.USE_DIFF_TRIMMER is on and both captures have an html format,
+    both sides are trimmed via the same extraction pipeline (never just
+    one side, which would show a diff full of extraction-style noise rather
+    than real content changes). Otherwise -- or if either side's html fetch
+    or trim fails -- both sides fall back to the full, untrimmed .txt.
+    """
+    if CFG.USE_DIFF_TRIMMER:
+        olderTrimmed = _fetch_html_trimmed(olderCapture, bucket, html_cache)
+        newerTrimmed = _fetch_html_trimmed(newerCapture, bucket, html_cache)
+        if olderTrimmed is not None and newerTrimmed is not None:
+            return olderTrimmed, newerTrimmed
+
+    olderPath = f"{olderCapture['path']}.txt"
+    newerPath = f"{newerCapture['path']}.txt"
+
+    olderText = doc_cache.get(olderPath)
+    if olderText is None:
+        logger.info(f"Cache miss - fetching {olderPath}")
+        olderText = _fetch_and_decode_with_retries(olderPath, bucket, doc_cache)
+    else:
+        logger.info(f"Cache hit - {olderPath}")
+
+    newerText = doc_cache.get(newerPath)
+    if newerText is None:
+        logger.info(f"Cache miss - fetching {newerPath}")
+        newerText = _fetch_and_decode_with_retries(newerPath, bucket, doc_cache)
+    else:
+        logger.info(f"Cache hit - {newerPath}")
+
+    return olderText, newerText
 
 
 def tokenize(text: str) -> list:
@@ -131,12 +240,19 @@ def patience_diff_tokens(tokens1: list, tokens2: list) -> list:
         for token in t2:
             count2[token] = count2.get(token, 0) + 1
 
+        # Precompute each token's position in t2 once (O(n)) instead of calling
+        # t2.index(token) inside the loop below -- that's an O(n) scan per
+        # call, making the loop O(n^2) overall on large documents. Safe because
+        # a token is only ever looked up here when count2[token] == 1, i.e. it
+        # has exactly one position in t2, so last-write-wins on duplicate keys
+        # never matters for the tokens this map is actually used for.
+        t2_index = {token: j for j, token in enumerate(t2)}
+
         # If the counts for a token in both input lists are both 1 then there's a unique match
         matches = []
         for i, token in enumerate(t1):
             if count1[token] == 1 and count2.get(token, 0) == 1:
-                j = t2.index(token)
-                matches.append((i, j))
+                matches.append((i, t2_index[token]))
 
         return matches
 
@@ -285,34 +401,42 @@ def reconstruct_with_whitespace(wordDiff: list, sp1: dict, sp2: dict) -> list:
     result = []
     idx1 = 0
     idx2 = 0
+    # Track the status of the previous word token so whitespace/special characters
+    # can inherit it. Starts as (False, False) so leading whitespace is unchanged.
+    prevAdded = False
+    prevRemoved = False
 
     for word, isAdded, isRemoved in wordDiff:
         if isRemoved:
             # Use special characters from past document
             if idx1 in sp1 and sp1[idx1]:
-                result.append((sp1[idx1], False, False))
+                result.append((sp1[idx1], prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx1 += 1
         elif isAdded:
             # Use special characters from new document
             if idx2 in sp2 and sp2[idx2]:
-                result.append((sp2[idx2], False, False))
+                result.append((sp2[idx2], prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx2 += 1
         else:
             # Unchanged word - prefer new special characters, fall back to old
             ws = sp2.get(idx2, sp1.get(idx1, ""))
             if ws:
-                result.append((ws, False, False))
+                result.append((ws, prevAdded, prevRemoved))
             result.append((word, isAdded, isRemoved))
             idx1 += 1
             idx2 += 1
 
-    # Handle any trailing whitespace
+        # Update previous token status after appending the word
+        prevAdded = isAdded
+        prevRemoved = isRemoved
+
+    # Handle any trailing whitespace, inherits the last word's status
     if idx1 in sp1:
-        result.append((sp1[idx1], False, False))
+        result.append((sp1[idx1], prevAdded, prevRemoved))
     elif idx2 in sp2:
-        result.append((sp2[idx2], False, False))
+        result.append((sp2[idx2], prevAdded, prevRemoved))
 
     return result
 
@@ -387,6 +511,224 @@ def create_patience_diff_data(oldText: str, newText: str):
     return result
 
 
+def _process_change_group(
+    group: dict,
+    mongoChangesDB: "Collection | None",
+    localChangesDB: list | None,
+    bucket,
+) -> None:
+    """
+    Builds every net-new .CHANGES.json diff for a single (company_id, type)
+    group of captures -- every pair (i, j), i < j, per CFG's product
+    requirement that the Comparison Tool support diffing any two historical
+    versions, not just consecutive ones.
+
+    Split out of create_changes_json so independent groups can be processed
+    in parallel (see create_changes_json), the same way the capture phase
+    parallelizes across documents via CFG.MAX_WORKERS.
+    """
+    companyId = group["_id"]["company_id"]
+    docType = group["_id"]["type"]
+    captures = group["captures"]
+
+    # If there's only one capture in this set of documents no Change document can be made
+    logger.info(f"Company ID: {companyId}, Type: {docType}...")
+    logger.info(f"Number of captures: {len(captures)}...")
+    if len(captures) <= 1:
+        logger.error(
+            f"No potential changes for company_id: {companyId}, type: {docType}"
+        )
+        return
+
+    # Ignore captures from the same date (this shouldn't happen, but won't display correctly on the webapp if it does)
+    capturesToIgnore = set()
+
+    for i in range(len(captures) - 1):
+        if i in capturesToIgnore:
+            continue
+
+        olderCapture = captures[i]
+        newerCapture = captures[i + 1]
+
+        olderDate = olderCapture["date_fetched"].strftime("%Y-%m-%d")
+        newerDate = newerCapture["date_fetched"].strftime("%Y-%m-%d")
+
+        # If this document has two captures from the same day ignore the older one and flag it in the log
+        if olderDate == newerDate:
+            logger.error(
+                f"Detected Duplicate date for {olderCapture} and {newerCapture}."
+            )
+            logger.error(
+                "Ignoring the older version from this date.  Content should be validated immediately"
+            )
+            capturesToIgnore.add(i)
+
+    validCaptures = [
+        cap for idx, cap in enumerate(captures) if idx not in capturesToIgnore
+    ]
+    # Now that we have a list of valid captures, we can calculate total possible changes
+    if len(validCaptures) <= 1:
+        # After reducing to only valid captures, there was only one version
+        logger.error(
+            f"No valid potential changes for company_id: {companyId}, type: {docType}"
+        )
+        return
+
+    # Cache decoded document text within this group only, sized to this
+    # group's own capture count. Any of these captures may be revisited
+    # across the O(n^2) pairwise comparisons below, so caching all of
+    # them avoids re-fetching/re-decoding the same text repeatedly -- but
+    # the cache is rebuilt fresh per group (rather than shared globally
+    # sized to the largest group in the whole run) so a company with a
+    # long capture history doesn't keep its decoded text resident in
+    # memory while later, unrelated groups are being processed.
+    doc_cache = DocumentCache(capacity=len(validCaptures))
+    # Separate cache for boundary-trimmed html text (see get_diff_text) --
+    # kept apart from doc_cache since it stores a different derived value
+    # (trimmed html-sourced text, not the raw .txt) under a different key
+    # (the html path, not the txt path) for the same underlying capture.
+    html_cache = DocumentCache(capacity=len(validCaptures))
+
+    # Fetch every existing (older_id, newer_id) pair for this company/type
+    # ONCE, rather than one find_one() per pair below -- the O(n^2) pairwise
+    # loop was previously making that many individual round trips (e.g. 325
+    # for a company with 26 captures), almost all of which just confirm a
+    # change created in a prior run. A single query plus in-memory set
+    # membership checks preserves identical behavior for a fraction of the
+    # DB load.
+    existingPairsQuery = {"company_id": companyId, "type": docType}
+    if CFG.USE_MONGO:
+        existingPairs = {
+            (doc["older_document_id"], doc["newer_document_id"])
+            for doc in mongoChangesDB.find(existingPairsQuery)
+        }
+    else:
+        existingPairs = {
+            (doc["older_document_id"], doc["newer_document_id"])
+            for doc in local_find(localChangesDB, existingPairsQuery)
+        }
+
+    # Iterate through the documents in time order
+    for i in range(len(validCaptures)):
+        for j in range(i + 1, len(validCaptures)):
+            olderCapture = validCaptures[i]
+            newerCapture = validCaptures[j]
+
+            changeExists = (
+                olderCapture["_id"],
+                newerCapture["_id"],
+            ) in existingPairs
+
+            if changeExists:
+                # This change does exist, we don't need to rebuild it
+                logger.info(
+                    f"Change already exists for company_id: {companyId}, type: {docType}, older_capture: {olderCapture['_id']}, newer_capture: {newerCapture['_id']}..."
+                )
+                continue
+
+            # This is a new change that needs to be created.
+            # The txt extension is always "txt" regardless of any historical drift in other formats.
+            # This is the canonical stored-capture path recorded in the change record below,
+            # independent of whichever text get_diff_text actually used to build the diff itself.
+            olderPath = f"{olderCapture['path']}.txt"
+            newerPath = f"{newerCapture['path']}.txt"
+
+            # Pull the display text -- boundary-trimmed html when
+            # CFG.USE_DIFF_TRIMMER allows it, otherwise the full
+            # untrimmed .txt -- from the GCP bucket.
+            olderText, newerText = get_diff_text(
+                olderCapture, newerCapture, bucket, doc_cache, html_cache
+            )
+            if olderText is None or newerText is None:
+                continue
+
+            # Create the diff data from the retrieved text content
+            diffData = create_patience_diff_data(olderText, newerText)
+
+            # Analyze the diff for any topic changes
+            addedText = "".join([item[0] for item in diffData if item[1]])
+            removedText = "".join([item[0] for item in diffData if item[2]])
+            topic_changes = analyze_topic_changes(addedText, removedText)
+
+            # Create version info string for the filename, ensure the timezone stays in utc
+            olderTimestamp = int(
+                olderCapture["date_fetched"].replace(tzinfo=timezone.utc).timestamp()
+            )
+            newerTimestamp = int(
+                newerCapture["date_fetched"].replace(tzinfo=timezone.utc).timestamp()
+            )
+            version_info = f"{olderTimestamp}-{newerTimestamp}"
+
+            # Create .CHANGES.json file path
+            changesFilePath = (
+                f"{CFG.CHANGES_DIR}/{companyId}/{docType}/{version_info}.CHANGES.json"
+            )
+
+            # Create .CHANGES.json file
+            change_data = {
+                "older_document": {
+                    "id": str(olderCapture["_id"]),
+                    "path": str(olderPath),
+                    "date_fetched": olderCapture["date_fetched"]
+                    .astimezone(timezone.utc)
+                    .isoformat(),
+                },
+                "newer_document": {
+                    "id": str(newerCapture["_id"]),
+                    "path": str(newerPath),
+                    "date_fetched": newerCapture["date_fetched"]
+                    .astimezone(timezone.utc)
+                    .isoformat(),
+                },
+                "topic_changes": topic_changes,
+                "diff": diffData,
+            }
+
+            # Upload to GCP
+            # Fix Windows path to be compatible with GCP
+            if not CFG.IN_CLOUD and CFG.USE_GCP:
+                changesData = json.dumps(change_data)
+                changesBlob = bucket.blob(changesFilePath)  # type: ignore
+                changesBlob.upload_from_string(
+                    data=changesData, content_type="application/json"
+                )
+            else:
+                # Save the changes file locally
+                output_path = CFG.CAPTURES_DIR / changesFilePath
+                os.makedirs(output_path.parent, exist_ok=True)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(change_data, f)
+
+            # Insert the changes info into the Changes collection to track it
+            change_document = {
+                "company_id": companyId,
+                "type": docType,
+                "older_document_id": olderCapture["_id"],
+                "newer_document_id": newerCapture["_id"],
+                "older_date_fetched": olderCapture["date_fetched"],
+                "newer_date_fetched": newerCapture["date_fetched"],
+                "path": changesFilePath,
+                "public_url": f"https://storage.googleapis.com/{CFG.GCP_BUCKET}/{changesFilePath}",
+            }
+            if CFG.USE_MONGO:
+                result = mongoChangesDB.insert_one(change_document)
+                logger.info(
+                    f"  Changes detected: Inserted to MongoDB (ID: {result.inserted_id})"
+                )
+            else:
+                save_db([change_document], CFG.CHANGES_BSON)
+                logger.info("  Changes detected: Inserted to local database")
+
+    # This group's doc_cache (and any diff data still referenced from the
+    # inner loops above) goes out of scope here; force a collection pass
+    # before this worker moves on to another group so a long capture history
+    # doesn't linger in memory while unrelated groups are being processed
+    # (peak memory across all workers is naturally higher than the old fully
+    # sequential version, since up to CFG.MAX_WORKERS groups' caches can now
+    # be alive at once -- the same tradeoff the capture phase already makes).
+    gc.collect()
+
+
 # Open connection to Mongo here so that it can be reused in the loop
 def create_changes_json(idSet: set | None = None):
     """
@@ -395,21 +737,24 @@ def create_changes_json(idSet: set | None = None):
     Args:
       idSet (set, optional): Set of company IDs to process. Defaults to None.
     """
-    localChangesDB: list
-    mongoChangesDB: Collection
+    # Only one of these ends up populated (based on CFG.USE_MONGO below), but
+    # both are always passed to _process_change_group, so both need a
+    # (unused-when-not-applicable) default rather than being left unbound.
+    localChangesDB: list | None = None
+    mongoChangesDB: Collection | None = None
     idList = list(idSet) if idSet else None
 
     # Connect to external dependencies
     if CFG.USE_MONGO:
         logger.info("Connecting to MongoDB...")
         mongoClient = mongo_connect()
-        collection = mongoClient[CFG.DB_NAME]["documents"]
+        collection = mongoClient[CFG.DB_NAME]["documents_v2"]
         mongoChangesDB = mongoClient[CFG.DB_NAME]["changes"]
         # Mongo pipeline to structure the documents data for creating Change files
         pipeline = [
             {
                 "$match": {
-                    "format": "txt",
+                    "formats.txt": {"$exists": True},
                     # Filter by the company IDs, if provided by idSet
                     **({"company_id": {"$in": idList}} if idList else {}),
                 }
@@ -420,13 +765,13 @@ def create_changes_json(idSet: set | None = None):
                     "_id": {
                         "company_id": "$company_id",
                         "type": "$type",
-                        "format": "$format",
                     },
                     "captures": {
                         "$push": {
                             "_id": "$_id",
                             "path": "$path",
                             "date_fetched": "$date_fetched",
+                            "formats": "$formats",
                         }
                     },
                 }
@@ -440,36 +785,37 @@ def create_changes_json(idSet: set | None = None):
         def local_aggregate(
             documents: list[dict], id_set: set | None = None
         ) -> list[dict]:
-            # $match: filter by format and optionally by company_id
+            # $match: filter by presence of a txt format and optionally by company_id
             matched = [
                 doc
                 for doc in documents
-                if doc.get("format") == "txt"
+                if "txt" in doc.get("formats", {})
                 and (id_set is None or doc.get("company_id") in id_set)
             ]
 
             # $sort: sort by date_fetched ascending
             sorted_docs = sorted(matched, key=lambda d: d["date_fetched"])
 
-            # $group: group by (company_id, type, format), pushing capture fields
+            # $group: group by (company_id, type), pushing capture fields
             groups: dict[tuple, list] = {}
             for doc in sorted_docs:
-                key = (doc.get("company_id"), doc.get("type"), doc.get("format"))
+                key = (doc.get("company_id"), doc.get("type"))
                 groups.setdefault(key, []).append(
                     {
                         "_id": doc["_id"],
                         "path": doc.get("path"),
                         "date_fetched": doc["date_fetched"],
+                        "formats": doc.get("formats", {}),
                     }
                 )
 
             # Shape the output to match MongoDB's $group result structure
             return [
                 {
-                    "_id": {"company_id": company_id, "type": type_, "format": format_},
+                    "_id": {"company_id": company_id, "type": type_},
                     "captures": captures,
                 }
-                for (company_id, type_, format_), captures in groups.items()
+                for (company_id, type_), captures in groups.items()
             ]
 
         grouped_captures = local_aggregate(collection, idSet)
@@ -481,183 +827,30 @@ def create_changes_json(idSet: set | None = None):
         googleClient = Client()
         bucket = googleClient.get_bucket(CFG.GCP_BUCKET)
 
-    max_captures = max((len(g["captures"]) for g in grouped_captures), default=10)
-    doc_cache = DocumentCache(capacity=max_captures)
-
-    # Process one company and docType at a time
-    for group in grouped_captures:
-        companyId = group["_id"]["company_id"]
-        docType = group["_id"]["type"]
-        format = group["_id"]["format"]
-        captures = group["captures"]
-
-        # If there's only one capture in this set of documents no Change document can be made
-        logger.info(f"Company ID: {companyId}, Type: {docType}, Format: {format}...")
-        logger.info(f"Number of captures: {len(captures)}...")
-        if len(captures) <= 1:
-            logger.error(
-                f"No potential changes for company_id: {companyId}, type: {docType}, format: {format}"
-            )
-            continue
-
-        # Ignore captures from the same date (this shouldn't happen, but won't display correctly on the webapp if it does)
-        capturesToIgnore = set()
-
-        for i in range(len(captures) - 1):
-            if i in capturesToIgnore:
-                continue
-
-            olderCapture = captures[i]
-            newerCapture = captures[i + 1]
-
-            olderDate = olderCapture["date_fetched"].strftime("%Y-%m-%d")
-            newerDate = newerCapture["date_fetched"].strftime("%Y-%m-%d")
-
-            # If this document has two captures from the same day ignore the older one and flag it in the log
-            if olderDate == newerDate:
+    # Process each (company_id, type) group in parallel -- groups are fully
+    # independent (distinct company_id/type keys never share a record), and
+    # each one mixes real I/O (GCS fetches, Mongo/local writes) with the diff
+    # computation, the same I/O-plus-CPU profile the capture phase already
+    # parallelizes via CFG.MAX_WORKERS in pipeline.py. The shared Mongo
+    # collection and GCS bucket handles are already used concurrently from
+    # multiple threads elsewhere in this codebase (pipeline.py shares its own
+    # the same way), so no new thread-safety concerns are introduced here.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CFG.MAX_WORKERS) as executor:
+        futureToGroup = {
+            executor.submit(
+                _process_change_group, group, mongoChangesDB, localChangesDB, bucket
+            ): group
+            for group in grouped_captures
+        }
+        for future in concurrent.futures.as_completed(futureToGroup):
+            group = futureToGroup[future]
+            try:
+                future.result()
+            except Exception as e:
                 logger.error(
-                    f"Detected Duplicate date for {olderCapture} and {newerCapture}."
+                    f"Failed to build changes for company_id: {group['_id']['company_id']}, "
+                    f"type: {group['_id']['type']}: {e}"
                 )
-                logger.error(
-                    "Ignoring the older version from this date.  Content should be validated immediately"
-                )
-                capturesToIgnore.add(i)
-
-        validCaptures = [
-            cap for idx, cap in enumerate(captures) if idx not in capturesToIgnore
-        ]
-        # Now that we have a list of valid captures, we can calculate total possible changes
-        if len(validCaptures) <= 1:
-            # After reducing to only valid captures, there was only one version
-            logger.error(
-                f"No valid potential changes for company_id: {companyId}, type: {docType}, format: {format}"
-            )
-            continue
-
-        # Iterate through the documents in time order
-        for i in range(len(validCaptures)):
-            for j in range(i + 1, len(validCaptures)):
-                olderCapture = validCaptures[i]
-                newerCapture = validCaptures[j]
-
-                # See if this Change document already exists
-                query = {
-                    "company_id": companyId,
-                    "type": docType,
-                    "older_document_id": olderCapture["_id"],
-                    "newer_document_id": newerCapture["_id"],
-                }
-                if CFG.USE_MONGO:
-                    changeExists = mongoChangesDB.find_one(query)
-                else:
-                    changeExists = local_find_one(localChangesDB, query)
-
-                if changeExists:
-                    # This change does exist, we don't need to rebuild it
-                    logger.info(
-                        f"Change already exists for company_id: {companyId}, type: {docType}, format: {format}, older_capture: {olderCapture['_id']}, newer_capture: {newerCapture['_id']}..."
-                    )
-                else:
-                    # This is a new change that needs to be created
-                    # Pull the data from the GCP bucket
-                    olderPath = olderCapture["path"]
-                    newerPath = newerCapture["path"]
-
-                    # Check cache before fetching from GCS
-                    olderText = doc_cache.get(olderPath)
-                    if olderText is None:
-                        logger.info(f"Cache miss — fetching {olderPath}")
-                        olderText = decode_bytes(get_gcs_bytes(olderPath, bucket))
-                        doc_cache.put(olderPath, olderText)
-                    else:
-                        logger.info(f"Cache hit — {olderPath}")
-
-                    newerText = doc_cache.get(newerPath)
-                    if newerText is None:
-                        logger.info(f"Cache miss — fetching {newerPath}")
-                        newerText = decode_bytes(get_gcs_bytes(newerPath, bucket))
-                        doc_cache.put(newerPath, newerText)
-                    else:
-                        logger.info(f"Cache hit — {newerPath}")
-
-                    # Create the diff data from the retrieved text content
-                    diffData = create_patience_diff_data(olderText, newerText)
-
-                    # Analyze the diff for any topic changes
-                    addedText = "".join([item[0] for item in diffData if item[1]])
-                    removedText = "".join([item[0] for item in diffData if item[2]])
-                    topic_changes = analyze_topic_changes(addedText, removedText)
-
-                    # Create version info string for the filename, ensure the timezone stays in utc
-                    olderTimestamp = int(
-                        olderCapture["date_fetched"]
-                        .replace(tzinfo=timezone.utc)
-                        .timestamp()
-                    )
-                    newerTimestamp = int(
-                        newerCapture["date_fetched"]
-                        .replace(tzinfo=timezone.utc)
-                        .timestamp()
-                    )
-                    version_info = f"{olderTimestamp}-{newerTimestamp}"
-
-                    # Create .CHANGES.json file path
-                    changesFilePath = f"{CFG.CHANGES_DIR}/{companyId}/{docType}/{version_info}.CHANGES.json"
-
-                    # Create .CHANGES.json file
-                    change_data = {
-                        "older_document": {
-                            "id": str(olderCapture["_id"]),
-                            "path": str(olderPath),
-                            "date_fetched": olderCapture["date_fetched"]
-                            .astimezone(timezone.utc)
-                            .isoformat(),
-                        },
-                        "newer_document": {
-                            "id": str(newerCapture["_id"]),
-                            "path": str(newerPath),
-                            "date_fetched": newerCapture["date_fetched"]
-                            .astimezone(timezone.utc)
-                            .isoformat(),
-                        },
-                        "topic_changes": topic_changes,
-                        "diff": diffData,
-                    }
-
-                    # Upload to GCP
-                    # Fix Windows path to be compatible with GCP
-                    if not CFG.IN_CLOUD and CFG.USE_GCP:
-                        changesData = json.dumps(change_data)
-                        changesBlob = bucket.blob(changesFilePath)  # type: ignore
-                        changesBlob.upload_from_string(
-                            data=changesData, content_type="application/json"
-                        )
-                    else:
-                        # Save the changes file locally
-                        output_path = CFG.CAPTURES_DIR / changesFilePath
-                        os.makedirs(output_path.parent, exist_ok=True)
-                        with open(output_path, "w", encoding="utf-8") as f:
-                            json.dump(change_data, f)
-
-                    # Insert the changes info into the Changes collection to track it
-                    change_document = {
-                        "company_id": companyId,
-                        "type": docType,
-                        "older_document_id": olderCapture["_id"],
-                        "newer_document_id": newerCapture["_id"],
-                        "older_date_fetched": olderCapture["date_fetched"],
-                        "newer_date_fetched": newerCapture["date_fetched"],
-                        "path": changesFilePath,
-                        "public_url": f"https://storage.googleapis.com/{CFG.GCP_BUCKET}/{changesFilePath}",
-                    }
-                    if CFG.USE_MONGO:
-                        result = mongoChangesDB.insert_one(change_document)
-                        logger.info(
-                            f"  Changes detected: Inserted to MongoDB (ID: {result.inserted_id})"
-                        )
-                    else:
-                        save_db([change_document], CFG.CHANGES_BSON)
-                        logger.info("  Changes detected: Inserted to local database")
 
 
 if __name__ == "__main__":

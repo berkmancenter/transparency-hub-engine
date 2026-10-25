@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 # Load environment variables from .env
@@ -51,15 +52,34 @@ class AppConfig:
     COMPANIES_JSON: Path = Path("db/companies.json")
     # Configuration Settings
     SYNC_PRIORITY: int = 1
+    # Upper bound on the priorities a run captures; 0 = no upper bound
+    SYNC_PRIORITY_MAX: int = 0
+    # Priority for companies without a PRIORITY_DICT entry
+    DEFAULT_PRIORITY: int = 1
     FUZZY_THRESHOLD: int = 97
-    MAX_WORKERS: int = 4
+    MAX_WORKERS: int = 2
     TIMEOUT: int = 1200
     CREATE_CHANGES: bool = True
     TOPIC_PATTERNS: dict = field(default_factory=dict)
     PRIORITY_DICT: dict = field(default_factory=dict)
+    # Policy-document classifier (source/policy_classifier.py)
+    USE_POLICY_CLASSIFIER: bool = True
+    POLICY_CLASSIFIER_THRESHOLD: float = 0.3
+    # Header/footer boundary trimmer (source/boundary_classifier.py). Cosmetic
+    # only: trims boilerplate out of the diff written to .CHANGES.json for
+    # display in the Comparison Tool. Never affects whether a capture is
+    # saved or a change is detected -- see source/changes.py.
+    USE_DIFF_TRIMMER: bool = False
+    DIFF_TRIMMER_THRESHOLD: float = 0.85
     # Slack Notifications
     USE_SLACK: bool = False
     SLACK_WEBHOOK_URL: str = ""
+    # Runtime memory safeguard: self-imposed address-space cap, set below the
+    # container's actual memory limit so a single oversized document raises a
+    # catchable MemoryError instead of the OS OOM-killing the whole process.
+    # 0 disables the cap (default, and always disabled outside POSIX).
+    MEMORY_LIMIT_MB: int = 0
+    MEMORY_SOFT_LIMIT_RATIO: float = 0.85
     # Program environment management
     IN_LOCAL: bool = True
     IN_CLOUD: bool = False
@@ -67,6 +87,59 @@ class AppConfig:
 
 
 CFG = AppConfig()
+
+
+def str_to_bool(value: str) -> bool:
+    """
+    Parses a CLI string argument into a bool. `argparse`'s built-in `type=bool`
+    just calls `bool()` on the raw string, so any non-empty value (including
+    "false") evaluates to True; this treats common truthy/falsy strings as
+    expected instead.
+    """
+    return value.lower() in ("true", "1", "yes", "t", "y")
+
+
+def apply_memory_safeguard():
+    """
+    Self-imposes a virtual address-space cap (RLIMIT_AS) below the
+    container's actual memory limit, when CFG.MEMORY_LIMIT_MB is configured.
+
+    Without this, a single oversized document (e.g. a large HTML DOM parse
+    or WACZ decompression during .txt reconstruction) can push the process
+    RSS up to the Cloud Run container's hard limit, at which point the Linux
+    OOM killer sends an uncatchable SIGKILL -- terminating every in-flight
+    worker and losing the run. With the cap in place, Python's own allocator
+    raises a normal MemoryError once the soft limit is crossed, which the
+    ThreadPoolExecutor's per-future exception handling can catch and log as
+    a single failed document instead of a killed container.
+
+    RLIMIT_AS is POSIX-only and is a no-op on Windows (local dev). It bounds
+    virtual address space rather than RSS directly, so it's a proxy for
+    actual memory use rather than an exact match -- fine here since nothing
+    in this pipeline reserves large address ranges without using them.
+    """
+    if CFG.MEMORY_LIMIT_MB <= 0:
+        return
+    try:
+        import resource  # type: ignore
+    except ImportError:
+        logger.info(
+            "Skipping memory safeguard: RLIMIT_AS is not available on this platform"
+        )
+        return
+
+    limit_bytes = int(CFG.MEMORY_LIMIT_MB * 1024 * 1024 * CFG.MEMORY_SOFT_LIMIT_RATIO)
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)  # type: ignore
+        if hard != resource.RLIM_INFINITY:  # type: ignore
+            limit_bytes = min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))  # type: ignore
+        logger.info(
+            f"Applied memory safeguard: RLIMIT_AS set to {limit_bytes / (1024 * 1024):.0f}MB "
+            f"({CFG.MEMORY_SOFT_LIMIT_RATIO:.0%} of configured {CFG.MEMORY_LIMIT_MB}MB container limit)"
+        )
+    except (ValueError, OSError) as e:
+        logger.warning(f"Failed to apply memory safeguard, continuing without it: {e}")
 
 
 def init_globals():
@@ -94,7 +167,7 @@ def init_globals():
 
     parser.add_argument(
         "--dry_run",
-        type=bool,
+        type=str_to_bool,
         default=os.getenv("DRY_RUN", "false").lower() == "true",
         help="Conduct a dry run, will not save outputs to external connections, will not delete temporary files from runtime (default: false)",
     )
@@ -170,6 +243,13 @@ def init_globals():
     )
 
     parser.add_argument(
+        "--sync_priority_max",
+        type=int,
+        default=int(os.getenv("SYNC_PRIORITY_MAX", 0)),
+        help="Highest priority to sync (default: 0, no upper bound). E.g. --sync_priority 1 --sync_priority_max 1 syncs only the priority-1 (monthly) tier",
+    )
+
+    parser.add_argument(
         "--config",
         type=str,
         default=os.getenv("CONFIG_PATH", "config.yaml"),
@@ -191,6 +271,7 @@ def init_globals():
     CFG.GCLOUD_REGION = args.gcloud_region
     CFG.GCLOUD_JOB = args.gcloud_job
     CFG.SYNC_PRIORITY = args.sync_priority
+    CFG.SYNC_PRIORITY_MAX = args.sync_priority_max
     # Not a global variable, only relevant for this module
     CONFIG_FILE = args.config
 
@@ -215,9 +296,16 @@ def init_globals():
             topic: [re.compile(p, re.IGNORECASE) for p in patterns]
             for topic, patterns in config.get("TOPIC_PATTERNS", {}).items()
         }
-        CFG.PRIORITY_DICT = config.get("PRIORITY_DICT", {})
+        CFG.PRIORITY_DICT = config.get("PRIORITY_DICT") or {}
+        CFG.DEFAULT_PRIORITY = config.get("DEFAULT_PRIORITY", 1)
+        CFG.USE_POLICY_CLASSIFIER = config.get("USE_POLICY_CLASSIFIER", True)
+        CFG.POLICY_CLASSIFIER_THRESHOLD = config.get("POLICY_CLASSIFIER_THRESHOLD", 0.3)
+        CFG.USE_DIFF_TRIMMER = config.get("USE_DIFF_TRIMMER", False)
+        CFG.DIFF_TRIMMER_THRESHOLD = config.get("DIFF_TRIMMER_THRESHOLD", 0.85)
         CFG.USE_SLACK = config.get("USE_SLACK", False)
         CFG.SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+        CFG.MEMORY_LIMIT_MB = config.get("MEMORY_LIMIT_MB", 0)
+        CFG.MEMORY_SOFT_LIMIT_RATIO = config.get("MEMORY_SOFT_LIMIT_RATIO", 0.85)
     except Exception as e:
         logger.error(f"Loading config failed, check {CONFIG_FILE}: {e}")
         sys.exit(1)
@@ -236,8 +324,8 @@ def init_globals():
         with open(CFG.LOG_DIR / "recovery_log.txt", "r") as f:
             recovery: list = f.read().splitlines()
         CFG.RECOVERY_DATA = recovery
-    except FileNotFoundError:
-        logger.info("No recovery file found, assuming fresh start")
+    except FileNotFoundError as e:
+        logger.error(f"No recovery file found, assuming fresh start: {e}")
     except Exception as e:
         logger.error(
             f"Loading recovery file failed, check {CFG.LOG_DIR / 'recovery_log.txt'}: {e}"
@@ -255,6 +343,8 @@ def init_globals():
     if not CFG.USE_MONGO:
         os.makedirs(CFG.DOCUMENTS_BSON.parent, exist_ok=True)
         os.makedirs(CFG.CHANGES_BSON.parent, exist_ok=True)
+
+    apply_memory_safeguard()
 
     if CFG.USE_GCP:
         if CFG.GCP_BUCKET == "my-bucket-1234":
@@ -286,6 +376,8 @@ def init_globals():
           GCLOUD_REGION = {CFG.GCLOUD_REGION}
           GCLOUD_JOB = {CFG.GCLOUD_JOB}
           SYNC_PRIORITY = {CFG.SYNC_PRIORITY}
+          SYNC_PRIORITY_MAX = {CFG.SYNC_PRIORITY_MAX or "none"}
+          DEFAULT_PRIORITY = {CFG.DEFAULT_PRIORITY}
           CONFIG_FILE = {CONFIG_FILE}
           USE_LOCAL_COMPANIES = {CFG.USE_LOCAL_COMPANIES}
           {"COMPANIES_JSON = " + str(CFG.COMPANIES_JSON) if CFG.USE_LOCAL_COMPANIES or not CFG.USE_MONGO else "None"}
@@ -294,8 +386,12 @@ def init_globals():
           MAX_WORKERS = {CFG.MAX_WORKERS}
           TIMEOUT = {CFG.TIMEOUT}
           CREATE_CHANGES = {CFG.CREATE_CHANGES}
+          USE_POLICY_CLASSIFIER = {CFG.USE_POLICY_CLASSIFIER}
+          {"POLICY_CLASSIFIER_THRESHOLD = " + str(CFG.POLICY_CLASSIFIER_THRESHOLD) if CFG.USE_POLICY_CLASSIFIER else "None"}
+          USE_DIFF_TRIMMER = {CFG.USE_DIFF_TRIMMER}
+          {"DIFF_TRIMMER_THRESHOLD = " + str(CFG.DIFF_TRIMMER_THRESHOLD) if CFG.USE_DIFF_TRIMMER else "None"}
           {"Topic Patterns are set in the config file" if CFG.TOPIC_PATTERNS != {} else "Topic Patterns are not set in the config file"}
-          {"Priority Dictionary is set in the config file: " + str(CFG.PRIORITY_DICT) if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
+          {"Priority Dictionary is set in the config file: " + str(dict(Counter(CFG.PRIORITY_DICT.values()))) + " (priority: company count)" if CFG.PRIORITY_DICT != {} else "Priority Dictionary is not set in the config file"}
           
           """
     logger.info(options_string)

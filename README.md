@@ -7,13 +7,14 @@ The Transparency Archiver powers the [Transparency Hub](https://hub.transparency
 ---
 
 ## Summary
- - [About](#about)
- - [Main Features](#main-features)
- - [Development](#development)
+
+- [About](#about)
+- [Main Features](#main-features)
+- [Development](#development)
 
 ---
 
-## About 
+## About  
 
 This is a document capture pipeline written in Python designed to be used with a custom locally hosted docker fork of Browsertrix Crawler.
 
@@ -31,12 +32,12 @@ It is recommended to run the Transparency Archiver as a docker image, but it is 
 
 It is designed to read data from a MongoDB (preferred) or .json file and retrieve current versions of documents from the urls in the data.
 
-
 We aim to store each document in 5 formats: txt, json, html, pdf, and wacz.
-Our data is stored in a MongoDB instance in 3 collections: `companies`, `documents`, and `changes`. 
+Our data is stored in a MongoDB instance in 3 collections: `companies`, `documents`, and `changes`.  
 
 Example `company` database entry:
-```
+
+```bson
 {
   "_id": {
     "$oid": "675211559efd527760c64413"
@@ -44,10 +45,22 @@ Example `company` database entry:
   "id": "platform",
   "name": "Platform",
   "doc_urls": {
-    "Terms of Service": "https://www.platform.com/terms",
-    "Privacy Policy": "http://www.platform.com/privacy",
-    "Community Guidelines": "https://platform.com/community-standards",
-    "Transparency Report": "https://platform.com/transparency"
+    "Terms of Service": {
+      "name": "Terms of Service",
+      "urls": ["https://www.platform.com/terms"]
+    },
+    "Privacy Policy": {
+      "name": "Privacy Policy",
+      "urls": ["http://www.platform.com/privacy"]
+    },
+    "Community Guidelines": {
+      "name": "Community Guidelines",
+      "urls": ["https://platform.com/community-standards"]
+    },
+    "Transparency Report": {
+      "name": "Transparency Report",
+      "urls": ["https://platform.com/transparency"]
+    }
   },
 
   # Below are Optional attributes
@@ -63,35 +76,56 @@ Example `company` database entry:
 ```
 
 Example `document` database entry:
-```
+
+```bson
 {
   "_id": {
     "$oid": "67784259cef22046ad5f727c"
   },
   "company_id": "675211559efd527760c64414",
-  "path": "company_id/type/unix_timestamp.txt",
   "type": "community_guidelines",
   "date_fetched": {
     "$date": "2025-01-03T20:02:32.024Z"
   },
-  "public_url": "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp.format",
-  "original_url": "https://company.com/type",
-  "format": "txt"
+  "path": "company_id/type/unix_timestamp",
+  "public_url": "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp",
+  "formats": {
+    "txt": {
+      "extension": "txt",
+      "original_url": "https://company.com/type"
+    },
+    "html": {
+      "extension": "html",
+      "original_url": "https://company.com/type"
+    }
+  }
 }
 ```
 
+A single capture (one company, document type, and `date_fetched`) is stored as **one** document. `path` and `public_url` are the base location with no file extension; `formats` lists whichever of the 5 formats (`txt`, `html`, `pdf`, `warc`, `warc.json`) were actually captured, each with its own `extension` (this matters because a given format hasn't always mapped to the same file extension over the project's history -- `warc` in particular) and its own `original_url` (almost always identical across formats, but occasionally a format like `pdf` is fetched from a distinct link).
 
-### MongoDB Compass (https://www.mongodb.com/compass) ###
+**To get the downloadable link for a specific format**, append a dot and that format's `extension` to `public_url`. For example, to get the `html` capture above:
+
+```text
+public_url + "." + formats["html"]["extension"]
+= "https://storage.googleapis.com/document_store/company_id/type/unix_timestamp.html"
+```
+
+If you're working in a spreadsheet rather than code, this is just string concatenation: `=CONCATENATE(public_url, ".", extension)` once you've pulled a format's `extension` out into its own column.
+
+### MongoDB Compass ([Mongo website](https://www.mongodb.com/compass))
+
 Transparency Archiver - Online Document Capture Tool is designed to work with a Mongo Database to maintain company and document information across multiple captures, although it can be configured to use local .json files.
 
 Download MongoDB Compass so you can view & engage with the data in a friendly UI.  You'll need to get a local instance running and then set your environment variable to point to it.
 To run the local instance, create "C:\data\db" then cd to "C:\Program Files\MongoDB\Server\8.0\bin" and run `mongod`
 
-`export MONGODB_URL='mongodb://localhost:27017/'` 
+`export MONGODB_URL='mongodb://localhost:27017/'`
 
 To view the front end, you'll need node.js and npm (see transparency_hub repo)
 
-### Google Cloud Platform Bucket ###
+### Google Cloud Platform Bucket
+
 Transparency Archiver - Online Document Capture Tool is designed to work with a Google Storage bucket for Snapshot storage, although it can be configured to use your local filesystem instead.
 
 Check out their [getting started guide](https://docs.cloud.google.com/docs/get-started) and their info on [creating a storage bucket](https://docs.cloud.google.com/storage/docs)
@@ -118,9 +152,15 @@ The .pdf format is provided for primary target urls in the Transparency Archiver
 
 The .html of the primary target url is provided as a closer-to-text format that preserves content the .txt format might have missed.  It can also be parsed to remove unwanted text material from a capture, such as detection of content from headers, footers, or pop-ups.  
 
-### TXT 
+### TXT
 
 The .txt format is provided for easy data access, parsing, and comparison.  This is a simple text parse of the client-side html at time of capture, and may include non-document content such as headers, footers, or pop-ups.
+
+If a capture doesn't produce a .txt directly, the pipeline backfills one by extracting text from whichever other format it did capture (preferring html, then pdf, then warc.json, then the raw warc/wacz as a last resort), so a .txt is available for nearly every archived document.
+
+Every .txt capture -- direct or backfilled -- is checked against a trained classifier (`source/policy_classifier.py`) that estimates whether it's actually a policy document as opposed to a bad capture (homepage, cookie wall, 404 page, login wall, ...). This is controlled by `USE_POLICY_CLASSIFIER`/`POLICY_CLASSIFIER_THRESHOLD` in `config.yaml` and requires a trained model at `models/policy_classifier.joblib` (see `scripts/build_policy_dataset.py` and `scripts/train_policy_classifier.py`).
+
+For captures with an HTML format, a second classifier (`source/boundary_classifier.py`) can trim the header/footer/nav boilerplate that surrounds the actual policy text out of the diff written to `.CHANGES.json`, so the Comparison Tool's display reads cleaner -- a nav link changing or a footer copyright year no longer shows up as noise alongside a real policy edit. This is purely cosmetic: it never affects what gets archived, whether a capture is treated as changed, or any other pipeline decision -- change-detection always runs on the full, untrimmed text. It only ever trims a high-confidence leading/trailing run of blocks (never the middle of a document), and only applies when both captures being diffed have an HTML format (otherwise the diff falls back to the full untrimmed text, as it always has). This is controlled by `USE_DIFF_TRIMMER`/`DIFF_TRIMMER_THRESHOLD` in `config.yaml` (off by default) and requires a trained model at `models/boundary_classifier.joblib` (see `scripts/build_boundary_dataset.py` and `scripts/train_boundary_classifier.py`).
 
 ### Other formats
 
@@ -131,14 +171,17 @@ The .CHANGES.json format is a change object based on the patience difference alg
 ---
 
 ### Running a DB sync: main.py
+
 The way we make production DB updates is by running the main.py script. This script reads through the `companies` database, fetches the current content at the listed `doc_urls`, compares it to the most recent snapshot of that policy document for that company (per format type), and then creates a new archive if they differ.  This script is designed to automatically update the MongoDB and GCP Storage Bucket it is given access to.
 
 #### Running in Docker
+
 This repo is set up to run as a docker image.  If you have Docker installed and running, you can use `docker-compose build` and `docker-compose up` to run the sync.
 
 This pipeline requires a built image of our [custom fork of BrowsertrixCrawler](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler) available in your Docker engine.  See that repo for build instructions.
 
 #### Running Locally
+
 This repo can be run locally with a user-installation of Python 3.13.3.  It still requires a built image of our [custom fork of BrowsertrixCrawler](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler) available in your Docker engine.  See that repo for build instructions.
 
 This script offers the following customization options from the command line:
@@ -168,13 +211,16 @@ Accepts a mongo connection string.  See MongoDB documentation for more details.
 
 `--gcloud_job` the Google Cloud Platform identifier for the Cloud Job of your custom BrowsertrixCrawler fork (default: my-job-1234)
 
-`--sync_priority` the priority level to run the sync at, highly configurable using the PRIORITY_DICT in the config.  When set to 1, will run on all companies not disabled in the config. (default: 1) 
+`--sync_priority` the priority level to run the sync at, highly configurable using the PRIORITY_DICT in the config.  When set to 1, will run on all companies not disabled in the config. (default: 1)
 Accepts any positive integer, though generally should be between 1-4 depending on your configuration setup.
+
+`--sync_priority_max` the highest priority level to run the sync at; 0 means no upper bound. Combined with `--sync_priority`, a run captures every company whose priority (its PRIORITY_DICT entry, or `DEFAULT_PRIORITY` in the config) falls in that range -- e.g. `--sync_priority 1 --sync_priority_max 1` captures only the priority-1 (monthly) tier. (default: 0)
 
 `--config` the Path to the configuration file. (default: config.yaml)
 Accepts any valid Path.
 
 #### Running on Google Cloud Platform
+
 The sync can be packaged to the Google Cloud Platform Artifact Registry if enabled on your project.  See `upload.demo.ps1` for guidelines on how to automatically push the sync to this Artifact Registry.  You'll also need to upload the config file to your Google Cloud Platform Storage Bucket, and will need to have a hosted MongoDB instance accessible with a connection string.  
 
 The sync job can then be configured with the following options:
@@ -199,35 +245,95 @@ CONFIG_PATH should be set wherever you store the config file within your Storage
 
 SYNC_PRIORITY can be set to whatever positive integer is appropriate. (Recommended: 1)
 
+Capture frequency is tiered with Cloud Scheduler triggers that override SYNC_PRIORITY (and SYNC_PRIORITY_MAX) per run, against the config's PRIORITY_DICT and DEFAULT_PRIORITY: a daily trigger at SYNC_PRIORITY=3 (major platforms), a weekly trigger at SYNC_PRIORITY=2 (everything except the monthly tier -- DEFAULT_PRIORITY is 2), and a monthly trigger at SYNC_PRIORITY=1 with SYNC_PRIORITY_MAX=1 (only the least-used companies, listed at priority 1). See the PRIORITY_DICT comments in `config.yaml`.
+
 GCP_BUCKET is the name of the mounted Storage Bucket.
 
 LOG_DIR should be set within the mount path of the Storage Bucket. (Recommended: /mnt/runtime/logs)
 
 MONGODB_URL should be established as a secret using the Google Cloud Platform Secret Manager.  This cannot use the local connection string.  
 
+### Wayback Backfill Job: `archive_backfill/`
+
+The live pipeline above only captures documents going forward from whenever a company is first added. `archive_backfill/` is a separate, self-contained job that fills in a company's *history* by pulling historical snapshots of its policy document urls from the [Wayback Machine](https://web.archive.org/), so the Comparison Tool's diff chain can extend back to whenever a page was first archived -- potentially as far back as 1997.
+
+It's a distinct Cloud Run Job from `document-capture`, with its own Dockerfile, requirements, and config, so it can be built, deployed, and scheduled independently. It still reads `companies` and writes `documents_v2` in the same production MongoDB database and GCS bucket as the live pipeline, so backfilled captures show up in the Comparison Tool immediately alongside live crawls, and it reuses the live pipeline's own text-reconstruction, quality-classifier, and `.CHANGES.json` generation code (`source/async_compare.py`, `source/policy_classifier.py`, `source/changes.py`) so a backfilled capture is held to the exact same quality bar as a live one.
+
+Because the Wayback Machine rate-limits fairly aggressively, this job works through its list of work by design, over many separate executions rather than one long run. Progress is tracked step-by-step in its own MongoDB database (`BACKFILL_DB_NAME`, separate from the live pipeline's database but on the same cluster) across two collections:
+
+- `discovery_progress` -- one row per (company, document type, url): has the Wayback Machine's CDX API been queried for this url's available snapshot timestamps yet?
+- `fetch_progress` -- one row per discovered (company, document type, url, timestamp): has that specific snapshot been downloaded, quality-checked, and stored?
+
+Every row is updated the moment its step completes, so a run that's stopped partway through (a time budget, a Cloud Run task timeout, a crash) always resumes cleanly on the next scheduled execution instead of losing progress -- see `archive_backfill/db.py`.
+
+Each run works on one company at a time, chosen automatically: it finishes whichever company is already in progress before starting the next unstarted one (alphabetically), so each platform's history fills in completely before moving on. `COMPANIES_PER_RUN` caps how many companies a run works through (default 1; a company where the Wayback Machine has no snapshots doesn't count toward it), and `DISCOVERY_BATCH_LIMIT`/`FETCH_BATCH_LIMIT` cap the total requests per run across them. A run also stops outright on the first HTTP 429 from web.archive.org.
+
+To build and deploy it:
+
+```powershell
+# Build and push the image (context is the repo root -- see archive_backfill/Dockerfile)
+./archive_backfill/upload.ps1
+
+# Deploy as its own Cloud Run Job (adjust flags to match your project/bucket/mongo secret)
+gcloud run jobs deploy archive-backfill `
+    --image us-east4-docker.pkg.dev/<project>/document-capture/archive_backfill:1.0 `
+    --region us-east4 `
+    --add-volume name=docstore,type=cloud-storage,bucket=<your-bucket> `
+    --add-volume-mount volume=docstore,mount-path=/mnt `
+    --set-secrets MONGODB_URL=mongodb-url:latest `
+    --set-env-vars GCP_BUCKET=<your-bucket>,GCLOUD_PROJECT=<your-project>,CAPTURES_DIR=/mnt `
+    --task-timeout 24h
+
+# Trigger it nightly via Cloud Scheduler
+./archive_backfill/scheduler.ps1
+```
+
+Configuration is split the same way as the live pipeline: `archive_backfill/.env.local` documents the environment variables (Mongo connection, GCP bucket, Slack webhook), and `archive_backfill/config.yaml` holds tunables (Wayback coverage window, rate-limit pacing, retry counts, batch/time budgets, quality-gate thresholds).
+
+One current limitation: a document type made up of more than one url (see "Support multi-URL doc types" in the commit history) isn't backfilled automatically -- the Wayback Machine's coverage can differ significantly between each component url, and naively merging independently-chosen snapshot dates per url would produce a misleading combined history. These are recorded with `status: "skipped_multi_url"` in `discovery_progress` for visibility rather than silently dropped.
+
 ## Related Repositories
 
 This project is part of the Transparency Hub ecosystem maintained by the Berkman Klein Center for Internet & Society at Harvard University:
 
 | Repository | Description |
-|-----------|-------------|
+| ----------- | ------------- |
 | **[Transparency Hub](https://github.com/berkmancenter/transparency-hub)** | Next.js frontend — the public-facing website |
 | **[Transparency Archiver](https://github.com/berkmancenter/transparency-hub-engine)** | Python pipeline that uses this crawler to archive policy documents |
 | **[Browsertrix Crawler Fork](https://github.com/berkmancenter/transparency-hub-browsertrix-crawler)** (this repo) | Custom fork of Browsertrix Crawler |
 
-
 ## Development
 
 ### Pre-commit hooks
+
 Install dev dependencies and activate the hooks once after cloning:
-```
+
+```bash
 pip install -r requirements-dev.txt
 pre-commit install
 ```
+
 This runs `ruff format` and `ruff check --fix` automatically on every commit.
 
 ### Linting (manual)
+
 `ruff format && ruff check --fix`
+
+### Testing
+
+The test suite lives in `tests/` and uses `pytest`. Install it alongside the runtime dependencies:
+
+`pip install -r requirements.txt && pip install pytest pytest-cov`
+
+Then run the suite from the repo root:
+
+`pytest`
+
+To see a coverage report:
+
+`pytest --cov --cov-report=term-missing`
+
+All external dependencies (MongoDB, Google Cloud Storage, the Browsertrix Crawler docker/subprocess/Cloud Run invocations, Slack webhooks, the filesystem) are faked or mocked, so the suite has no network, database, or docker requirements and never touches your real `.env`, `tmp/`, `logs/`, or `db/` directories. It also strips the handful of environment variables this codebase reads (`MONGODB_URL`, `GCP_BUCKET`, etc.) before each test, so a developer's local `.env` credentials never leak into test assertions.
 
 ## Contributing
 

@@ -1,18 +1,21 @@
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.env
-.git
-.gitignore
-*.md
-.vscode/
-.idea/
-config.yaml
-recovery.txt
-logs/
-companies*
-db/
+# Allowlist: ignore everything by default, then explicitly un-ignore only
+# what main.py needs at runtime. A new file the runtime needs must be added here explicitly too, or the
+# image builds fine but fails at runtime -- fail loud, not fail quiet.
+#
+# NOTE: config.yaml is intentionally NOT included -- it's injected at
+# runtime via docker-compose's `configs:` mount (see docker-compose.yml)
+# or, in Cloud Run, mounted from the GCS bucket (see README.md).
+*
+
+!main.py
+!requirements.txt
+!source
+!source/**
+!models
+!models/**
+
+# Rules below apply AFTER the negations above (last-match-wins), so they
+# re-exclude compiled bytecode that would otherwise ride along inside the
+# allowed source/ tree.
+**/__pycache__
+**/*.pyc

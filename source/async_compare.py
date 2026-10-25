@@ -15,16 +15,26 @@ from rapidfuzz import fuzz
 import re
 import json
 import langdetect
-import asyncio
+import concurrent.futures
 from pathlib import Path
+from typing import Optional
 
 # Local Imports
 from source.globals import CFG, logger
-from source.utils import get_gcs_bytes, decode_bytes
+from source.utils import get_gcs_bytes, decode_bytes, normalize_seed_url
+
+
+# Caps the input handed to rapidfuzz's C++ implementation. rapidfuzz raises a raw
+# C++ std::bad_alloc (not Python's catchable MemoryError) if an internal allocation
+# fails, which crashes the whole process via std::terminate -- no try/except here can
+# stop that. A malformed or duplicated reconstruction (see process.py
+# reconstruct_missing_txt) could otherwise hand it a pathologically large string; real
+# policy documents are far smaller than this cap, so truncating doesn't affect them.
+MAX_FUZZY_COMPARE_CHARS = 500_000
 
 
 def has_content_changed(
-    oldText: str, newText: str, threshold: int = CFG.FUZZY_THRESHOLD
+    oldText: str, newText: str, threshold: Optional[int] = None
 ) -> bool:
     """
     Identifies if the content of two documents has changed
@@ -33,11 +43,13 @@ def has_content_changed(
     Args:
         oldText (str): The text of the old document
         newText (str): The text of the new document
-        threshold (int, optional): The threshold for fuzzy matching. Defaults to FUZZY_THRESHOLD.
+        threshold (int, optional): The threshold for fuzzy matching. Defaults to the live CFG.FUZZY_THRESHOLD value.
 
     Returns:
         bool: True if the content has changed beyond the threshold, False otherwise
     """
+    if threshold is None:
+        threshold = CFG.FUZZY_THRESHOLD
 
     def text_normalize(text: str) -> str:
         """
@@ -57,7 +69,10 @@ def has_content_changed(
     logger.debug(f"New text: {newText[:1000]}")
 
     # Perform fuzzy matching on text with a ratio of at least 97%
-    ratio = fuzz.ratio(text_normalize(oldText), text_normalize(newText))
+    ratio = fuzz.ratio(
+        text_normalize(oldText[:MAX_FUZZY_COMPARE_CHARS]),
+        text_normalize(newText[:MAX_FUZZY_COMPARE_CHARS]),
+    )
     return ratio < threshold
 
 
@@ -86,7 +101,28 @@ def read_text_from_html(htmlObj: bytes) -> str:
     return soup.get_text(separator=" ", strip=True)
 
 
-def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
+# Caps the total text accumulated while unzipping/decompressing a WACZ archive.
+# This is the last-resort format in RECONSTRUCTION_FORMAT_PRIORITY (raw WARC/WACZ is
+# the heaviest and messiest source), and unlike the other formats it has no inherent
+# size limit -- a page with a lot of captured network traffic (large data tables, many
+# embedded resources) can produce a WACZ whose fully decompressed, joined text is many
+# times larger than the page itself. That's cheap to allocate in Python but can trip an
+# uncaught C++ std::bad_alloc in a downstream native call (rapidfuzz, lxml) that isn't
+# translated into a catchable MemoryError, crashing the whole process. Stopping
+# accumulation once this cap is hit keeps the feature working for the WACZ sizes actually
+# produced by a single crawled page, while bounding the pathological case.
+MAX_WACZ_EXTRACT_CHARS = 2_000_000
+
+# Guards against a single pathologically large entry within the WACZ (e.g. a page whose
+# WARC response body is much bigger than typical page text) blowing past
+# MAX_WACZ_EXTRACT_CHARS in one shot -- the cumulative cap above only stops *further*
+# entries once crossed, so a single oversized one needs its own check before it's read
+# and decompressed at all. zipfile's central-directory metadata reports each entry's
+# uncompressed size without having to read/decompress it first.
+MAX_WACZ_ENTRY_BYTES = 20_000_000
+
+
+def read_wacz_file(data: bytes, mode: str = "wacz") -> str:
     """
     A wrapper for extracting text from a WARC file bundle
 
@@ -108,6 +144,7 @@ def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
           list: A list of all the extracted text
         """
         allText = []
+        totalChars = 0
 
         fileList = wacz.namelist()
         warcFiles = [
@@ -119,6 +156,18 @@ def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
         htmlFiles = [file for file in fileList if file.endswith(".html")]
 
         for warcFile in warcFiles:
+            if totalChars >= MAX_WACZ_EXTRACT_CHARS:
+                logger.warning(
+                    f"WACZ text extraction hit the {MAX_WACZ_EXTRACT_CHARS}-char cap, "
+                    f"skipping remaining WARC entries"
+                )
+                break
+            if wacz.getinfo(warcFile).file_size > MAX_WACZ_ENTRY_BYTES:
+                logger.warning(
+                    f"Skipping oversized WARC entry {warcFile} "
+                    f"({wacz.getinfo(warcFile).file_size} bytes)"
+                )
+                continue
             try:
                 content = wacz.read(warcFile)
                 if warcFile.endswith(".warc.gz"):
@@ -127,16 +176,30 @@ def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
                 text = decode_bytes(content)
                 if text:
                     allText.append(text)
+                    totalChars += len(text)
             except Exception as e:
                 logger.error(f"Error reading WARC file: {e}")
                 continue
 
         for htmlFile in htmlFiles:
+            if totalChars >= MAX_WACZ_EXTRACT_CHARS:
+                logger.warning(
+                    f"WACZ text extraction hit the {MAX_WACZ_EXTRACT_CHARS}-char cap, "
+                    f"skipping remaining HTML entries"
+                )
+                break
+            if wacz.getinfo(htmlFile).file_size > MAX_WACZ_ENTRY_BYTES:
+                logger.warning(
+                    f"Skipping oversized HTML entry {htmlFile} "
+                    f"({wacz.getinfo(htmlFile).file_size} bytes)"
+                )
+                continue
             try:
                 content = wacz.read(htmlFile)
                 text = read_text_from_html(content)
                 if text:
                     allText.append(text)
+                    totalChars += len(text)
             except Exception as e:
                 logger.error(f"Error reading HTML file: {e}")
                 continue
@@ -159,38 +222,6 @@ def read_wacz_file(data: bytes, mode: str = "wacz.gz") -> str:
     except Exception as e:
         logger.error(f"Error reading WARC file: {e}")
         return ""
-
-
-def compare_warc_files(gcsBytes: bytes, localPath: Path, gcpPath: str) -> bool:
-    """
-    Compares two WARC files and returns True if they have changed, False otherwise
-
-    Args:
-        gcsBytes: The bytes of the GCS file to compare
-        localPath: The local path of the WARC file to compare
-        gcpPath: The GCP path of the WARC file to compare
-
-    Returns:
-        bool: True if the file has changed, False otherwise
-    """
-    # Compare WARC files - support both wacz and warc.gz
-    with open(localPath, "rb") as f:
-        localBytes = f.read()
-
-    if str(localPath).endswith(".warc.gz"):
-        localMode = "warc.gz"
-    else:
-        localMode = "wacz"
-
-    localText = read_wacz_file(localBytes, localMode)
-    if str(gcpPath).endswith(".warc.gz"):
-        gcpMode = "warc.gz"
-    else:
-        gcpMode = "wacz"
-    gcsText = read_wacz_file(gcsBytes, gcpMode)
-
-    # Perform fuzzy matching on text with a ratio of at least 97%
-    return has_content_changed(localText, gcsText)
 
 
 def compare_html_files(gcsBytes: bytes, localPath: Path) -> bool:
@@ -293,7 +324,140 @@ def compare_json_files(gcsBytes: bytes, localPath: Path) -> bool:
     return has_content_changed(extract_json_text(localJson), extract_json_text(gcsJson))
 
 
-def data_quality_check(text: str) -> bool:
+def passes_policy_document_check(text: str) -> bool:
+    """
+    Runs the trained policy-document classifier (source/policy_classifier.py)
+    against text destined to become a .txt capture (whether captured directly
+    or reconstructed from another format), rejecting captures the model is
+    confident are NOT an actual policy document (homepage, cookie wall, 404
+    page, login wall, ...).
+
+    Fails open (returns True) if CFG.USE_POLICY_CLASSIFIER is False or if the
+    classifier can't be loaded/run, so a missing or broken model file
+    degrades to pre-classifier behavior instead of blocking every capture.
+
+    Args:
+      text (str): The candidate .txt document text to classify.
+
+    Returns:
+      bool: True if the text should be treated as a valid policy document.
+    """
+    if not CFG.USE_POLICY_CLASSIFIER:
+        return True
+    try:
+        from source.policy_classifier import is_policy_document
+
+        return is_policy_document(text, threshold=CFG.POLICY_CLASSIFIER_THRESHOLD)
+    except Exception as e:
+        logger.warning(
+            f"Policy-document classifier check failed, allowing capture through: {e}"
+        )
+        return True
+
+
+RECONSTRUCTION_FORMAT_PRIORITY = ["html", "pdf", "warc.json", "warc"]
+
+
+def extract_text_from_pdf_bytes(rawBytes: bytes) -> str:
+    """
+    Extracts text from raw PDF bytes.
+
+    Args:
+      rawBytes (bytes): The raw bytes of a PDF file.
+
+    Returns:
+      str: The extracted text.
+    """
+    reader = PyPDF2.PdfReader(io.BytesIO(rawBytes))
+    return "".join(page.extract_text() for page in reader.pages)
+
+
+def extract_text_from_warc_json_bytes(
+    rawBytes: bytes, originalUrl: str | list[str] = ""
+) -> str:
+    """
+    Extracts text from a warc.json file's raw bytes. warc.json's "records"
+    list has one entry per unique page visited during the crawl, so this
+    prefers the records whose urls include one of originalUrl's (the actual
+    target page(s)) over blindly concatenating every page the crawler
+    happened to visit. A document can be captured from more than one seed
+    url (a document split across pages), in which case every matching
+    record's content is joined -- mirroring how a directly-captured .txt
+    merges multiple pages (see process.py ProcessCrawl.merge_txt_files).
+
+    Args:
+      rawBytes (bytes): The raw bytes of a warc.json file.
+      originalUrl (str | list[str]): The document's own source url(s), used
+        to select matching records. Accepts a single url (legacy captures
+        stored it as a plain string) or a list. If omitted or none are
+        found, every record is joined instead.
+
+    Returns:
+      str: The extracted text.
+    """
+    data = json.loads(rawBytes)
+    records = data.get("records", [])
+
+    targetUrls = [originalUrl] if isinstance(originalUrl, str) else list(originalUrl)
+    targetUrls = [url for url in targetUrls if url]
+
+    if targetUrls:
+        # records are in the order the crawler finished pages, which varies
+        # from run to run -- order the matches by seed url instead, the same
+        # order merge_txt_files uses, so the text is stable across captures
+        seedIndex = {}
+        for i, url in enumerate(targetUrls):
+            seedIndex.setdefault(normalize_seed_url(url), i)
+        ranked = []
+        for record in records:
+            ranks = [
+                seedIndex[normalize_seed_url(url)]
+                for url in record.get("urls", [])
+                if normalize_seed_url(url) in seedIndex
+            ]
+            if ranks:
+                ranked.append((min(ranks), record.get("content", "")))
+        if ranked:
+            ranked.sort(key=lambda r: r[0])
+            return "\n\n".join(content for _, content in ranked)
+
+    return "\n\n".join(record.get("content", "") for record in records)
+
+
+def reconstruct_text_from_format(
+    rawBytes: bytes, format: str, extension: str, originalUrl: str | list[str] = ""
+) -> str:
+    """
+    Extracts text from an already-captured format, used to backfill a
+    missing .txt capture when the crawl itself didn't produce one directly.
+
+    Args:
+      rawBytes (bytes): The raw bytes of the already-captured format's file.
+      format (str): The format key to reconstruct from ("html", "pdf",
+        "warc.json", or "warc").
+      extension (str): The file extension of the captured format, used to
+        distinguish "warc" stored as .wacz vs .warc.gz.
+      originalUrl (str | list[str]): The document's own source url(s), used
+        to disambiguate warc.json records. Accepts a single url (legacy
+        captures) or a list (current captures, which can have more than one
+        seed url).
+
+    Returns:
+      str: The extracted text, or an empty string for an unrecognized format.
+    """
+    if format == "html":
+        return read_text_from_html(rawBytes)
+    if format == "pdf":
+        return extract_text_from_pdf_bytes(rawBytes)
+    if format == "warc.json":
+        return extract_text_from_warc_json_bytes(rawBytes, originalUrl)
+    if format == "warc":
+        mode = "warc.gz" if extension.endswith("warc.gz") else "wacz"
+        return read_wacz_file(rawBytes, mode)
+    return ""
+
+
+def data_quality_check(text: Optional[str]) -> bool:
     # If the text is None or empty, return False
     if text is None or len(text.strip()) == 0:
         return False
@@ -332,24 +496,6 @@ def _compare_files_sync(localPath: Path, gcpPath: str, format: str, bucket) -> b
     return False
 
 
-async def compare_files_async(
-    localPath: Path, gcpPath: str, format: str, bucket, timeout: int = 300
-) -> bool:
-    loop = asyncio.get_running_loop()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                None, _compare_files_sync, localPath, gcpPath, format, bucket
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"Comparison timed out after {timeout}s for {localPath} ({format})"
-        )
-        return False
-
-
 def _validate_file_sync(localPath: Path, format: str) -> bool:
     if format == "warc":
         return True
@@ -379,46 +525,73 @@ def _validate_file_sync(localPath: Path, format: str) -> bool:
             if "content" in record:
                 text += record["content"]
 
-    return data_quality_check(text)
-
-
-async def validate_file_async(localPath: Path, format: str, timeout: int = 300) -> bool:
-    loop = asyncio.get_running_loop()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, _validate_file_sync, localPath, format),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"Validation timed out after {timeout}s for {localPath} ({format})"
-        )
+    if not data_quality_check(text):
         return False
+
+    if format in ("txt", "warc.json"):
+        return passes_policy_document_check(text)
+
+    return True
+
+
+# compare_files/validate_file each run their sync counterpart in a fresh,
+# single-use worker thread rather than a shared pool. An earlier version of
+# this code (briefly) used one shared, bounded ThreadPoolExecutor for every
+# call -- but future.result(timeout=...) only stops WAITING on a timeout, it
+# can't cancel the underlying thread, so a genuinely stuck call (e.g. a hung
+# GCS FUSE read inside get_gcs_bytes, source/utils.py) keeps occupying one of
+# the shared pool's limited worker slots for as long as ITS OWN internal
+# timeout takes to fire. Enough concurrent hangs could exhaust every shared
+# slot, making every OTHER in-flight comparison/validation queue behind them
+# and time out too, even though its own file was perfectly fine. A fresh
+# executor per call (matching get_gcs_bytes' own pattern) keeps a stuck call
+# isolated to its own abandoned thread, exactly like the old per-call asyncio
+# event loop this replaced.
+def _run_with_timeout(func, args: tuple, timeout: float, timeout_message: str):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(func, *args)
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        logger.warning(timeout_message)
+        return False
+    finally:
+        executor.shutdown(wait=False)
 
 
 def compare_files(
-    localPath: Path, gcpPath: str, format: str, bucket, timeout: int = 300
+    localPath: Path, gcpPath: str, format: str, bucket, timeout: float = 300
 ) -> bool:
     """
-    Wrapper function for compare_files_async, allows for setting a timeout in case the file processing pipeline hangs
+    Wrapper for _compare_files_sync, allows for setting a timeout in case the file processing pipeline hangs
 
     Args:
       localPath (str): Path to the local file
       gcpPath (str): Path to the GCP file
       format (str): Format of the file
       bucket (str): Name of the GCP bucket (None if running in Google Cloud)
-      timeout (int): Timeout in seconds, defaults to 300 (5 minutes)
+      timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    return asyncio.run(compare_files_async(localPath, gcpPath, format, bucket, timeout))
+    return _run_with_timeout(
+        _compare_files_sync,
+        (localPath, gcpPath, format, bucket),
+        timeout,
+        f"Comparison timed out after {timeout}s for {localPath} ({format})",
+    )
 
 
-def validate_file(localPath, format, timeout=300):
+def validate_file(localPath, format, timeout=300.0):
     """
-    Wrapper function for validate_file_async, allows for setting a timeout in case the file processing pipeline hangs
+    Wrapper for _validate_file_sync, allows for setting a timeout in case the file processing pipeline hangs
 
     Args:
       localPath (str): Path to the local file
       format (str): Format of the file
-      timeout (int): Timeout in seconds, defaults to 300 (5 minutes)
+      timeout (float): Timeout in seconds, defaults to 300 (5 minutes)
     """
-    return asyncio.run(validate_file_async(localPath, format, timeout))
+    return _run_with_timeout(
+        _validate_file_sync,
+        (localPath, format),
+        timeout,
+        f"Validation timed out after {timeout}s for {localPath} ({format})",
+    )
